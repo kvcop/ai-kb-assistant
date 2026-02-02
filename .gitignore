@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.log
+.tmp/
+.cache/
+logs/
+
+# Sensitive data
+*.env
+.secrets/
+config.local.json
+
+.env
+.env.*
+!.env.example
+!.env.tg_bot.example
+
+# Codex TG bot runtime
+.codex-tg/*
+
+# MCP (Codex) persistent memory (local state; do not commit)
+.mcp/*
+!.mcp/README.md
+
+# Telegram uploads (saved attachments)
+tg_uploads/*
+!tg_uploads/.gitkeep
+
+# Codex Q&A scratch (never commit)
+QUESTIONS.md

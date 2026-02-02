@@ -1,0 +1,88 @@
+[project]
+name = "tg-codex-bridge-bot"
+version = "0.1.0"
+description = "Telegram ↔ Codex bridge + watcher (RND KB)"
+readme = "tg_bot/README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy==1.19.1",
+    "pydantic>=2.6.0",
+    "ruff==0.14.9",
+]
+
+[tool.ruff]
+line-length = 120
+required-version = "0.14.9"
+target-version = "py311"
+extend-exclude = [
+    ".tmp",
+    ".venv",
+    "archive",
+    "logs",
+    "notes",
+    "tg_uploads",
+    "tmp",
+]
+
+[tool.ruff.lint]
+dummy-variable-rgx = "^_$"
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = [
+    "D105",
+    "D107",
+    "D401",
+    "D403",
+    "D404",
+    "E501",
+    "ERA",
+    "FBT",
+    "FIX",
+    "G",
+    "ISC001",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "S311",
+    "TD001",
+    "TD002",
+    "TD003",
+    "TRY400",
+    "TRY401",
+    "COM812",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tg_bot/tests/*" = ["D", "PLR2004", "S101"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+line-ending = "lf"
+quote-style = "single"
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+python_version = "3.11"
+files = ["tg_bot"]
+
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_no_return = true
+strict_optional = true
+
+exclude = ["tg_bot/tests/"]
+ignore_missing_imports = true
+strict = true

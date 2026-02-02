@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Codex Bridge Bot (RND KB)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/kb-repo
+# Env is loaded by tg_bot itself from:
+#   - /path/to/kb-repo/tg_bot/.env
+#   - /path/to/kb-repo/.env.tg_bot
+#
+# If you prefer systemd-managed env, uncomment:
+# EnvironmentFile=/path/to/kb-repo/.env.tg_bot
+# Prefer running from repo-local venv (e.g. created via `uv venv .venv`).
+ExecStart=/path/to/kb-repo/.venv/bin/python -m tg_bot
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

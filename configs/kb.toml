@@ -1,0 +1,41 @@
+[kb]
+repo_name = "kb-template"
+
+[jira]
+# Jira base URL and auth are read from environment:
+# - `JIRA_URL`
+# - `JIRA_TOKEN`
+# - `JIRA_USERNAME` (optional; if set, Basic auth is used; otherwise Bearer token)
+api_version = 2
+max_results = 200
+
+# Default query for "my assigned tasks" (helper).
+jql = """
+assignee = currentUser()
+AND statusCategory != Done
+ORDER BY priority DESC, updated DESC
+"""
+
+# Minimal set for daily planning/briefing.
+fields = [
+  "summary",
+  "status",
+  "priority",
+  "assignee",
+  "created",
+  "updated",
+  "duedate",
+  "labels",
+  "issuetype",
+]
+
+[taxonomy]
+# Optional: used to group Jira tasks by themes.
+# Paths can be absolute, or relative to the repo root.
+path = ""
+
+# Optional: local cache DB (issue_key -> theme_id/confidence/reason/locked).
+classification_db = ""
+
+# Tasks below this confidence are highlighted as "needs review".
+confidence_low = 0.80

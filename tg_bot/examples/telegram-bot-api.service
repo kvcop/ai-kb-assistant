@@ -1,0 +1,34 @@
+[Unit]
+Description=Telegram Bot API server (Local Mode, docker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Put TELEGRAM_API_ID / TELEGRAM_API_HASH here (create the file and chmod 600):
+#   %h/.config/telegram-bot-api/env
+EnvironmentFile=%h/.config/telegram-bot-api/env
+
+# Keep Bot API data on the host so tg_bot can read absolute file paths from getFile().
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/telegram-bot-api %h/.local/share/telegram-bot-api/tmp
+
+ExecStart=/usr/bin/docker run --rm --name telegram-bot-api \
+  --user=%U:%G \
+  --entrypoint /usr/local/bin/telegram-bot-api \
+  -p 127.0.0.1:8081:8081 \
+  -v %h/.local/share/telegram-bot-api:%h/.local/share/telegram-bot-api \
+  -v %h/.local/share/telegram-bot-api/tmp:%h/.local/share/telegram-bot-api/tmp \
+  -e TELEGRAM_API_ID \
+  -e TELEGRAM_API_HASH \
+  aiogram/telegram-bot-api:latest \
+  --local \
+  --http-port=8081 \
+  --dir=%h/.local/share/telegram-bot-api \
+  --temp-dir=%h/.local/share/telegram-bot-api/tmp
+
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
