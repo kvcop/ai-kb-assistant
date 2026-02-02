@@ -250,7 +250,7 @@ class BotConfig:
 
         tg_bot_api_local_url = (os.getenv('TG_BOT_API_LOCAL_URL') or 'http://127.0.0.1:8081').strip()
         tg_bot_api_remote_url = (os.getenv('TG_BOT_API_REMOTE_URL') or 'https://api.telegram.org').strip()
-        tg_bot_api_prefer_local = _env_bool('TG_BOT_API_PREFER_LOCAL', True)
+        tg_bot_api_prefer_local = _env_bool('TG_BOT_API_PREFER_LOCAL', False)
         tg_bot_api_probe_seconds = max(60, min(3600, _env_int('TG_BOT_API_PROBE_SECONDS', 300)))
 
         tg_poll_timeout_seconds = _env_int('TG_POLL_TIMEOUT_SECONDS', 25)
@@ -278,7 +278,7 @@ class BotConfig:
         tg_upload_max_mb = max(0, _env_int('TG_UPLOAD_MAX_MB', 50))
         tg_upload_max_bytes = int(tg_upload_max_mb) * 1024 * 1024
 
-        tg_voice_auto_transcribe = _env_bool('TG_VOICE_AUTO_TRANSCRIBE', True)
+        tg_voice_auto_transcribe = _env_bool('TG_VOICE_AUTO_TRANSCRIBE', False)
         tg_voice_echo_transcript = _env_bool('TG_VOICE_ECHO_TRANSCRIPT', False)
         tg_voice_transcribe_timeout_seconds = max(10, min(300, _env_int('TG_VOICE_TRANSCRIBE_TIMEOUT_SECONDS', 300)))
         tg_voice_apply_typos = _env_bool('TG_VOICE_APPLY_TYPO_GLOSSARY', True)

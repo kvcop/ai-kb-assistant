@@ -114,7 +114,7 @@
 ## Файлы (attachments)
 
 - Бот скачивает вложения из Telegram (documents/photos/video/audio/voice) и сохраняет их на диск в `tg_uploads/<chat_id>/...` (настраивается через `TG_UPLOADS_DIR`).
-- **Voice** (голосовые) — по умолчанию **авто‑распознаются** через Speech2Text (`speech2text`) и сразу отправляются в роутер как обычный текстовый запрос (выключить: `TG_VOICE_AUTO_TRANSCRIBE=0`; опционально показать расшифровку: `TG_VOICE_ECHO_TRANSCRIPT=1`; опционально выключить авто‑исправления по глоссарию `notes/work/typos.md`: `TG_VOICE_APPLY_TYPO_GLOSSARY=0`). Требуется токен `speech2text` (см. `python3 scripts/speech2text.py login ...` или `SPEECH2TEXT_TOKEN=...`); base URL берётся из `SPEECH2TEXT_BASE_URL` (по умолчанию: `http://127.0.0.1:8000/api`).
+- **Voice** (голосовые) — по умолчанию **не авто‑распознаются** (чтобы не требовать `speech2text` “из коробки”). Включить авто‑распознавание: `TG_VOICE_AUTO_TRANSCRIBE=1`. Опционально: показать расшифровку `TG_VOICE_ECHO_TRANSCRIPT=1`; выключить авто‑исправления по глоссарию `notes/work/typos.md`: `TG_VOICE_APPLY_TYPO_GLOSSARY=0`. Для авто‑распознавания требуется токен `speech2text` (см. `python3 scripts/speech2text.py login ...` или `SPEECH2TEXT_TOKEN=...`); base URL берётся из `SPEECH2TEXT_BASE_URL` (по умолчанию: `http://127.0.0.1:8000/api`).
 - Если файл отправлен **без подписи** (caption) — бот переходит в режим ожидания: копит файлы и ждёт следующий текст; следующий текст будет отправлен в Codex **вместе со списком путей** к сохранённым файлам.
 - Если подряд отправить несколько файлов без подписи — они все накопятся; следующий текст “подцепится” ко всем ожидающим файлам.
 - Лимит размера скачивания: `TG_UPLOAD_MAX_MB` (default: `50`; `0` = без лимита).
@@ -193,7 +193,7 @@ python3 -m tg_bot
 - `TG_CODEX_PROBE_TIMEOUT_SECONDS` (default: `3`)
 - `TG_BOT_API_LOCAL_URL` (default: `http://127.0.0.1:8081`) — Local Bot API server (официальный `telegram-bot-api`)
 - `TG_BOT_API_REMOTE_URL` (default: `https://api.telegram.org`) — fallback на облачный Bot API
-- `TG_BOT_API_PREFER_LOCAL` (default: `1`) — если `1`, бот по умолчанию ходит в local и при недоступности переключается на remote
+- `TG_BOT_API_PREFER_LOCAL` (default: `0`) — если `1`, бот предпочитает local Bot API server и при недоступности переключается на remote; если `0`, по умолчанию использует remote
 - `TG_BOT_API_PROBE_SECONDS` (default: `300`) — если сейчас выбран remote, раз в N секунд пробуем вернуться на local
 - `TG_SINGLE_INSTANCE` (default: `1`) — запрещает запускать две копии бота одновременно (через файловый lock)
 - `TG_UPLOADS_DIR` (default: `tg_uploads`) — куда сохранять вложения из Telegram
