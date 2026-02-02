@@ -5,9 +5,6 @@ Knowledge Base maintenance helper.
 Host requirements:
 - Python 3.10+ (3.11+ recommended for built-in TOML parser)
 - Optional: Jira access via `JIRA_URL` + `JIRA_TOKEN` (+ `JIRA_USERNAME` for Basic auth)
-- Optional: taxonomy + classification cache (configure in `configs/kb.toml`):
-  - taxonomy YAML: `taxonomy.path`
-  - sqlite cache: `taxonomy.classification_db`
 
 Typical usage from repository root:
   python scripts/kb.py doctor
@@ -25,7 +22,6 @@ import difflib
 import json
 import os
 import re
-import sqlite3
 import sys
 import textwrap
 import time
@@ -670,171 +666,6 @@ class JiraIssue:
     labels: list[str]
 
 
-@dataclasses.dataclass(frozen=True)
-class IssueClassification:
-    issue_key: str
-    issue_updated: str
-    theme_id: str
-    confidence: float
-    reason: str
-    locked: bool
-
-
-@dataclasses.dataclass(frozen=True)
-class ThemeNode:
-    node_id: str
-    title: str
-    children: tuple[ThemeNode, ...]
-
-
-class ThemeResolver:
-    def __init__(self, roots: list[ThemeNode]) -> None:
-        self._path_to_titles: dict[str, list[str]] = {}
-        self._variant_to_path: dict[str, str] = {}
-        self._leaf_to_paths: dict[str, set[str]] = {}
-
-        for root in roots:
-            self._index_node(root, parent_path=None, parent_titles=[])
-
-        self._build_variants()
-
-    def _index_node(self, node: ThemeNode, parent_path: str | None, parent_titles: list[str]) -> None:
-        path = node.node_id if parent_path is None else f'{parent_path}.{node.node_id}'
-        titles = [*parent_titles, node.title]
-        self._path_to_titles[path] = titles
-        self._leaf_to_paths.setdefault(node.node_id, set()).add(path)
-        for child in node.children:
-            self._index_node(child, parent_path=path, parent_titles=titles)
-
-    def _build_variants(self) -> None:
-        joiners = ['.', '/', '-', '_', ' > ']
-
-        variant_to_paths: dict[str, set[str]] = {}
-        for path in self._path_to_titles.keys():
-            segments = path.split('.')
-            for start in range(len(segments)):
-                suffix = segments[start:]
-                for joiner in joiners:
-                    variant = joiner.join(suffix)
-                    variant_to_paths.setdefault(variant, set()).add(path)
-
-        # Keep only unambiguous variants.
-        self._variant_to_path = {
-            variant: next(iter(paths)) for variant, paths in variant_to_paths.items() if len(paths) == 1
-        }
-
-    def resolve_path(self, raw_theme_id: str | None) -> str | None:
-        if not raw_theme_id:
-            return None
-
-        raw = raw_theme_id.strip()
-
-        if raw in self._variant_to_path:
-            return self._variant_to_path[raw]
-
-        if raw in self._leaf_to_paths and len(self._leaf_to_paths[raw]) == 1:
-            return next(iter(self._leaf_to_paths[raw]))
-
-        return None
-
-    def title_path(self, canonical_path: str | None) -> str | None:
-        if not canonical_path:
-            return None
-        titles = self._path_to_titles.get(canonical_path)
-        if not titles:
-            return None
-        return ' → '.join(titles)
-
-
-def _parse_simple_taxonomy_yaml(path: Path) -> list[ThemeNode]:
-    """
-    Minimal YAML parser for the repo's taxonomy.yaml structure (id/title/children only).
-    Does not support general YAML; intended specifically for jira-mindmap taxonomy.
-    """
-
-    def parse_scalar(value: str) -> str:
-        value = value.strip()
-        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
-            return value[1:-1]
-        return value
-
-    roots: list[dict[str, Any]] = []
-    list_stack: list[tuple[int, list[dict[str, Any]]]] = [(0, roots)]
-    current_node_by_list_indent: dict[int, dict[str, Any]] = {}
-
-    for raw_line in _read_text(path).splitlines():
-        line = raw_line.rstrip()
-        if not line.strip() or line.lstrip().startswith('#'):
-            continue
-
-        indent = len(line) - len(line.lstrip(' '))
-        stripped = line.strip()
-
-        if stripped.startswith('- id:'):
-            value = parse_scalar(stripped.split(':', 1)[1])
-            while list_stack and list_stack[-1][0] != indent:
-                if indent < list_stack[-1][0]:
-                    list_stack.pop()
-                else:
-                    break
-            if not list_stack or list_stack[-1][0] != indent:
-                raise ValueError(f'Unsupported taxonomy indentation at: {raw_line}')
-            node: dict[str, Any] = {'id': value, 'title': '', 'children': []}
-            list_stack[-1][1].append(node)
-            current_node_by_list_indent[indent] = node
-            continue
-
-        if stripped.startswith('title:'):
-            value = parse_scalar(stripped.split(':', 1)[1])
-            list_indent = indent - 2
-            node = current_node_by_list_indent.get(list_indent)
-            if not node:
-                raise ValueError(f'Orphan title line at: {raw_line}')
-            node['title'] = value
-            continue
-
-        if stripped.startswith('children:'):
-            list_indent = indent - 2
-            node = current_node_by_list_indent.get(list_indent)
-            if not node:
-                raise ValueError(f'Orphan children line at: {raw_line}')
-            child_list_indent = indent + 2
-            list_stack.append((child_list_indent, node['children']))
-            continue
-
-        raise ValueError(f'Unsupported taxonomy line: {raw_line}')
-
-    def to_node(raw_node: Mapping[str, Any]) -> ThemeNode:
-        children = tuple(to_node(child) for child in raw_node.get('children', []))
-        title = raw_node.get('title', '') or raw_node.get('id', '')
-        return ThemeNode(node_id=str(raw_node['id']), title=str(title), children=children)
-
-    return [to_node(node) for node in roots]
-
-
-def _load_classification(db_path: Path) -> dict[str, IssueClassification]:
-    uri = f'file:{db_path}?mode=ro'
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        rows = conn.execute(
-            'SELECT issue_key, issue_updated, theme_id, confidence, reason, locked FROM issueclassification'
-        ).fetchall()
-    finally:
-        conn.close()
-
-    out: dict[str, IssueClassification] = {}
-    for issue_key, issue_updated, theme_id, confidence, reason, locked in rows:
-        out[str(issue_key)] = IssueClassification(
-            issue_key=str(issue_key),
-            issue_updated=str(issue_updated),
-            theme_id=str(theme_id),
-            confidence=float(confidence),
-            reason=str(reason),
-            locked=bool(locked),
-        )
-    return out
-
-
 class JiraClient:
     def __init__(self, base_url: str, token: str, username: str | None, api_version: int) -> None:
         self._base_url = base_url.rstrip('/')
@@ -1277,8 +1108,8 @@ def _load_jira_client(config: dict[str, Any]) -> JiraClient:
 
     if not base_url or not token:
         raise RuntimeError(
-            'Missing Jira auth. Set `JIRA_URL` and `JIRA_TOKEN` (and optionally `JIRA_USERNAME`) '
-            'or put them into `.env`.'
+            'Jira is not configured (optional). '
+            'To enable Jira sync, set `JIRA_URL` and `JIRA_TOKEN` (and optionally `JIRA_USERNAME`) in `.env`.'
         )
 
     api_version = int(jira_cfg.get('api_version') or 2)
@@ -1317,14 +1148,10 @@ def _render_brief(
     *,
     config: dict[str, Any],
     snapshot: dict[str, Any],
-    theme_resolver: ThemeResolver | None,
-    classifications: dict[str, IssueClassification] | None,
     rendered_at: dt.datetime,
     jira_sync_error: str | None,
 ) -> str:
     jira_cfg = config.get('jira') or {}
-    taxonomy_cfg = config.get('taxonomy') or {}
-    confidence_low = float(taxonomy_cfg.get('confidence_low') or 0.80)
 
     issues_raw = snapshot.get('issues') or []
     issues = [_parse_snapshot_issue(x) for x in issues_raw]
@@ -1343,25 +1170,13 @@ def _render_brief(
             return key
         return f'{base}/browse/{key}'
 
-    def theme_label(issue_key: str) -> str | None:
-        if not classifications or not theme_resolver:
-            return None
-        cls = classifications.get(issue_key)
-        if not cls:
-            return None
-        canonical = theme_resolver.resolve_path(cls.theme_id)
-        title_path = theme_resolver.title_path(canonical) if canonical else None
-        return title_path or canonical or cls.theme_id
-
     def due_bucket(issue: JiraIssue) -> tuple[dt.date | None, int | None]:
         due = _parse_ymd_date(issue.duedate)
         if not due:
             return None, None
         return due, (due - today).days
 
-    def format_issue_line(
-        issue: JiraIssue, *, cls: IssueClassification | None = None, include_theme: bool = True
-    ) -> str:
+    def format_issue_line(issue: JiraIssue) -> str:
         status = issue.status or '—'
         priority = issue.priority or '—'
 
@@ -1375,36 +1190,11 @@ def _render_brief(
             else:
                 due_part = f', due {due.isoformat()} (in {delta}d)'
 
-        suffix = ''
-        if cls:
-            suffix = f' | conf={cls.confidence:.2f}' + (' | locked' if cls.locked else '')
+        return f'- [{issue.key}]({jira_link(issue.key)}) — {issue.summary} ({status}, {priority}{due_part})'
 
-        theme_part = ''
-        if include_theme:
-            label = theme_label(issue.key)
-            if label:
-                theme_part = f' — {label}'
-
-        return f'- [{issue.key}]({jira_link(issue.key)}) — {issue.summary} ({status}, {priority}{due_part}{suffix}){theme_part}'
-
-    grouped: dict[str, list[tuple[JiraIssue, IssueClassification | None, str | None]]] = {}
-    needs_review: list[str] = []
-
+    grouped: dict[str, list[JiraIssue]] = {}
     for issue in issues:
-        cls = classifications.get(issue.key) if classifications else None
-        canonical = theme_resolver.resolve_path(cls.theme_id) if (theme_resolver and cls) else None
-        title_path = theme_resolver.title_path(canonical) if (theme_resolver and canonical) else None
-        group_key = title_path or canonical or (cls.theme_id if cls else 'Без темы')
-        grouped.setdefault(group_key, []).append((issue, cls, canonical))
-
-        if not cls:
-            needs_review.append(f'- {issue.key} — {issue.summary} — нет классификации (theme_id)')
-        elif cls.confidence < confidence_low:
-            needs_review.append(
-                f'- {issue.key} — {issue.summary} — низкая уверенность {cls.confidence:.2f} ({cls.theme_id})'
-            )
-        elif not canonical and theme_resolver:
-            needs_review.append(f'- {issue.key} — {issue.summary} — theme_id не маппится на taxonomy ({cls.theme_id})')
+        grouped.setdefault(issue.status or 'Unknown', []).append(issue)
 
     open_issues = [issue for issue in issues if not _is_done_status(issue.status)]
     done_issues = [issue for issue in issues if _is_done_status(issue.status)]
@@ -1434,7 +1224,7 @@ def _render_brief(
     lines.append(f'**Rendered at**: {rendered_at.isoformat(timespec="seconds")}')
     lines.append(f'**Snapshot at**: {str(snapshot_generated_at)}')
     if jira_sync_error:
-        lines.append(f'**Jira sync**: unavailable ({jira_sync_error})')
+        lines.append(f'**Jira sync**: skipped ({jira_sync_error})')
     lines.append('')
     lines.append('## Jira Query')
     lines.append('```jql')
@@ -1454,8 +1244,7 @@ def _render_brief(
     lines.append('## Focus candidates (top 5)')
     if focus_candidates:
         for issue in focus_candidates:
-            cls = classifications.get(issue.key) if classifications else None
-            lines.append(format_issue_line(issue, cls=cls, include_theme=True))
+            lines.append(format_issue_line(issue))
     else:
         lines.append('- (none)')
     lines.append('')
@@ -1463,34 +1252,25 @@ def _render_brief(
     lines.append('## Overdue / Due soon (<= 2 days)')
     if overdue_or_soon:
         for _, issue in overdue_or_soon:
-            cls = classifications.get(issue.key) if classifications else None
-            lines.append(format_issue_line(issue, cls=cls, include_theme=True))
+            lines.append(format_issue_line(issue))
     else:
         lines.append('- (none)')
     lines.append('')
 
-    lines.append('## Needs Review')
-    if needs_review:
-        lines.extend(needs_review)
-    else:
-        lines.append('- (none)')
-    lines.append('')
-
-    lines.append('## By Theme')
-    for group_name in sorted(grouped.keys()):
+    lines.append('## By Status')
+    for group_name in sorted(grouped.keys(), key=lambda x: (_status_rank(x), x.casefold())):
         items = grouped[group_name]
         lines.append('')
         lines.append(f'### {group_name}')
-        for issue, cls, _ in sorted(
+        for issue in sorted(
             items,
-            key=lambda t: (
-                _status_rank(t[0].status),
-                _priority_rank(t[0].priority),
-                due_bucket(t[0])[0] or dt.date.max,
-                t[0].key,
+            key=lambda i: (
+                _priority_rank(i.priority),
+                due_bucket(i)[0] or dt.date.max,
+                i.key,
             ),
         ):
-            lines.append(format_issue_line(issue, cls=cls, include_theme=False))
+            lines.append(format_issue_line(issue))
 
     if done_issues:
         lines.append('')
@@ -1503,8 +1283,7 @@ def _render_brief(
                 i.key,
             ),
         ):
-            cls = classifications.get(issue.key) if classifications else None
-            lines.append(format_issue_line(issue, cls=cls, include_theme=True))
+            lines.append(format_issue_line(issue))
         lines.append('')
 
     return _compact_lines('\n'.join(lines))
@@ -1516,8 +1295,6 @@ def _render_eod(
     cur: dict[str, Any],
     closing_date: dt.date,
     manual_sections: dict[str, list[str]] | None,
-    theme_resolver: ThemeResolver | None,
-    classifications: dict[str, IssueClassification] | None,
     jira_sync_error: str | None,
 ) -> str:
     prev_issues = {str(x.get('key') or ''): x for x in (prev.get('issues') or [])} if prev else {}
@@ -1551,7 +1328,7 @@ def _render_eod(
     lines.append('')
     lines.append(f'**Generated at**: {generated_at}')
     if jira_sync_error:
-        lines.append(f'**Jira sync**: unavailable ({jira_sync_error})')
+        lines.append(f'**Jira sync**: skipped ({jira_sync_error})')
     lines.append('')
     lines.append('## Jira Delta (vs previous snapshot)')
     if not has_prev:
@@ -1580,16 +1357,6 @@ def _render_eod(
         for key, before, after in status_changed:
             lines.append(f'- {key}: {before or "—"} → {after or "—"}')
         lines.append('')
-
-    def resolve_theme(issue_key: str) -> str | None:
-        if not theme_resolver or not classifications:
-            return None
-        cls = classifications.get(issue_key)
-        if not cls:
-            return None
-        canonical = theme_resolver.resolve_path(cls.theme_id)
-        title_path = theme_resolver.title_path(canonical) if canonical else None
-        return title_path or canonical or cls.theme_id
 
     def has_content(body: list[str] | None) -> bool:
         return bool(body) and any(line.strip() for line in body)
@@ -1671,9 +1438,7 @@ def _render_eod(
         for key in candidate_keys[:8]:
             raw = cur_issues.get(key) or {}
             issue = _parse_snapshot_issue(raw)
-            theme = resolve_theme(key)
-            theme_part = f' — {theme}' if theme else ''
-            lines.append(f'  - {key} — __h — {issue.summary}{theme_part}')
+            lines.append(f'  - {key} — __h — {issue.summary}')
         lines.append('')
 
     lines.append('## Friction / Improvements (optional)')
@@ -2631,23 +2396,6 @@ def _extract_open_project_todos(markdown: str) -> dict[str, list[str]]:
     return out
 
 
-def _extract_needs_review_items(markdown: str) -> list[str]:
-    sections = _extract_h2_section_bodies(markdown)
-    for title, body in sections.items():
-        if title.strip().lower().startswith('needs review'):
-            out: list[str] = []
-            for raw in body:
-                line = raw.strip()
-                if not line.startswith('-'):
-                    continue
-                item = line.lstrip('-').strip()
-                if not item or item == '(none)':
-                    continue
-                out.append(item)
-            return out
-    return []
-
-
 def _extract_note_mentioned_keys(markdown: str) -> list[str]:
     sections = _extract_h2_section_bodies(markdown)
     for title, body in sections.items():
@@ -3110,13 +2858,6 @@ def cmd_questions(args: argparse.Namespace) -> int:
         except OSError:
             project_todos = {}
 
-    needs_review: list[str] = []
-    if BRIEF_PATH.exists():
-        try:
-            needs_review = _extract_needs_review_items(_read_text(BRIEF_PATH))
-        except OSError:
-            needs_review = []
-
     md_day = _load_day_markdown(target_date) or ''
     mentioned_keys = _extract_note_mentioned_keys(md_day) if md_day else []
     _filled, missing, _reviews, _lines = _extract_time_entries_for_day(day=target_date, issue_titles=issue_titles)
@@ -3155,12 +2896,6 @@ def cmd_questions(args: argparse.Namespace) -> int:
             out_lines.append(f'- {label} — confirm status/comment update?')
         out_lines.append('')
 
-    if needs_review:
-        out_lines.append('## Needs Review (taxonomy)')
-        for item in needs_review:
-            out_lines.append(f'- {item}')
-        out_lines.append('')
-
     if manual_questions:
         out_lines.append('## Open Questions (manual)')
         for item in manual_questions:
@@ -3192,7 +2927,7 @@ def cmd_questions(args: argparse.Namespace) -> int:
             out_lines.append(f'- … {total - shown} more (see `{todo_rel}`)')
         out_lines.append('')
 
-    if not (problems or missing_filtered or jira_hygiene or needs_review or manual_questions or project_todos):
+    if not (problems or missing_filtered or jira_hygiene or manual_questions or project_todos):
         out_lines.append('## Nothing pending')
         out_lines.append('- (none)')
         out_lines.append('')
@@ -3289,17 +3024,9 @@ def cmd_render_brief(args: argparse.Namespace) -> int:
         raise RuntimeError('No snapshots found. Run `jira-sync` first.')
     snapshot = _load_snapshot(snapshot_path)
 
-    theme_resolver, classifications = _load_theme_context(
-        config,
-        taxonomy_override=args.taxonomy,
-        classification_db_override=args.classification_db,
-    )
-
     md = _render_brief(
         config=config,
         snapshot=snapshot,
-        theme_resolver=theme_resolver,
-        classifications=classifications,
         rendered_at=_now(),
         jira_sync_error=None,
     )
@@ -3310,37 +3037,7 @@ def cmd_render_brief(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_theme_context(
-    config: dict[str, Any],
-    *,
-    taxonomy_override: str | None,
-    classification_db_override: str | None,
-) -> tuple[ThemeResolver | None, dict[str, IssueClassification] | None]:
-    taxonomy_cfg = config.get('taxonomy') or {}
-    taxonomy_path_raw = (taxonomy_override or taxonomy_cfg.get('path') or '').strip()
-    taxonomy_path = Path(taxonomy_path_raw) if taxonomy_path_raw else Path()
-    if taxonomy_path and not taxonomy_path.is_absolute():
-        taxonomy_path = _resolve_repo_path(taxonomy_path)
-
-    class_db_raw = (classification_db_override or taxonomy_cfg.get('classification_db') or '').strip()
-    class_db_path = Path(class_db_raw) if class_db_raw else Path()
-    if class_db_path and not class_db_path.is_absolute():
-        class_db_path = _resolve_repo_path(class_db_path)
-
-    theme_resolver: ThemeResolver | None = None
-    if taxonomy_path and taxonomy_path.exists():
-        theme_resolver = ThemeResolver(_parse_simple_taxonomy_yaml(taxonomy_path))
-
-    classifications: dict[str, IssueClassification] | None = None
-    if class_db_path and class_db_path.exists():
-        classifications = _load_classification(class_db_path)
-
-    return theme_resolver, classifications
-
-
 def cmd_render_eod(args: argparse.Namespace) -> int:
-    config = _load_toml(_resolve_repo_path(args.config))
-
     snapshot_path = _resolve_repo_path(args.snapshot) if args.snapshot else _latest_snapshot()
     if not snapshot_path:
         raise RuntimeError('No snapshots found. Run `jira-sync` first.')
@@ -3389,19 +3086,11 @@ def cmd_render_eod(args: argparse.Namespace) -> int:
         )
         manual_sections['Time Tracking (draft)'] = normalized
 
-    theme_resolver, classifications = _load_theme_context(
-        config,
-        taxonomy_override=getattr(args, 'taxonomy', None),
-        classification_db_override=getattr(args, 'classification_db', None),
-    )
-
     md = _render_eod(
         prev=prev,
         cur=cur,
         closing_date=closing_date,
         manual_sections=manual_sections,
-        theme_resolver=theme_resolver,
-        classifications=classifications,
         jira_sync_error=getattr(args, 'jira_sync_error', None),
     )
 
@@ -3577,16 +3266,9 @@ def cmd_day_start(args: argparse.Namespace) -> int:
 
     if snapshot_path and snapshot_path.exists():
         snapshot = _load_snapshot(snapshot_path)
-        theme_resolver, classifications = _load_theme_context(
-            config,
-            taxonomy_override=args.taxonomy,
-            classification_db_override=args.classification_db,
-        )
         md = _render_brief(
             config=config,
             snapshot=snapshot,
-            theme_resolver=theme_resolver,
-            classifications=classifications,
             rendered_at=rendered_at,
             jira_sync_error=sync_error,
         )
@@ -3621,12 +3303,12 @@ def cmd_day_start(args: argparse.Namespace) -> int:
     lines.append('')
     lines.append(f'**Rendered at**: {rendered_at.isoformat(timespec="seconds")}')
     if sync_error:
-        lines.append(f'**Jira sync**: unavailable ({sync_error})')
+        lines.append(f'**Jira sync**: skipped ({sync_error})')
     else:
-        lines.append('**Jira sync**: unavailable (no snapshots found)')
+        lines.append('**Jira sync**: skipped (no snapshots found)')
     lines.append('')
     lines.append('## Notes')
-    lines.append("- Set Jira env vars (`.env`) or paste today's tasks export.")
+    lines.append('- If you use Jira: set `JIRA_URL`/`JIRA_TOKEN` in `.env`. Otherwise keep this file as your plan.')
     lines.append('')
 
     _write_text(out_path, _compact_lines('\n'.join(lines)))
@@ -3664,9 +3346,9 @@ def cmd_end_day(args: argparse.Namespace) -> int:
         lines.append('')
         lines.append(f'**Generated at**: {_now().isoformat(timespec="seconds")}')
         if sync_error:
-            lines.append(f'**Jira sync**: unavailable ({sync_error})')
+            lines.append(f'**Jira sync**: skipped ({sync_error})')
         else:
-            lines.append('**Jira sync**: unavailable (no snapshots found)')
+            lines.append('**Jira sync**: skipped (no snapshots found)')
         lines.append('')
         lines.append('## Notes (keep short)')
         lines.append('- Add 3–7 bullets: what moved, what blocked, what decided.')
@@ -3693,8 +3375,6 @@ def cmd_end_day(args: argparse.Namespace) -> int:
         out=args.out,
         date=closing_date.isoformat(),
         write_daily_log=True,
-        taxonomy=getattr(args, 'taxonomy', None),
-        classification_db=getattr(args, 'classification_db', None),
         jira_sync_error=sync_error,
     )
     result = cmd_render_eod(eod_args)
@@ -3797,8 +3477,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_brief = sub.add_parser('render-brief', help='Generate notes/work/daily-brief.md from latest snapshot')
     p_brief.add_argument('--snapshot', help='Snapshot JSON path (default: latest in logs/jira-snapshots/)')
     p_brief.add_argument('--out', help='Output markdown path (default: notes/work/daily-brief.md)')
-    p_brief.add_argument('--taxonomy', help='Override taxonomy.yaml path')
-    p_brief.add_argument('--classification-db', help='Override jira_mindmap.db path')
     p_brief.set_defaults(func=cmd_render_brief)
 
     p_eod = sub.add_parser('render-eod', help='Generate end-of-day delta from snapshots')
@@ -3807,8 +3485,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_eod.add_argument('--date', help='Day to close (YYYY-MM-DD). Default: snapshot date.')
     p_eod.add_argument('--out', help='Output markdown path (default: notes/work/end-of-day.md)')
     p_eod.add_argument('--write-daily-log', action='store_true', help='Also write notes/daily-logs/<date>.md')
-    p_eod.add_argument('--taxonomy', help='Override taxonomy.yaml path')
-    p_eod.add_argument('--classification-db', help='Override jira_mindmap.db path')
     p_eod.set_defaults(func=cmd_render_eod)
 
     p_open = sub.add_parser('open-day', help="Ensure today's end-of-day container exists (for log-notes)")
@@ -3826,16 +3502,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_day = sub.add_parser('day-start', help='Sync Jira and generate daily brief')
     p_day.add_argument('--jql', help='Override JQL from config')
     p_day.add_argument('--out', help='Output markdown path (default: notes/work/daily-brief.md)')
-    p_day.add_argument('--taxonomy', help='Override taxonomy.yaml path')
-    p_day.add_argument('--classification-db', help='Override jira_mindmap.db path')
     p_day.set_defaults(func=cmd_day_start)
 
     p_end = sub.add_parser('end-day', help='Sync Jira and generate end-of-day delta report')
     p_end.add_argument('--jql', help='Override JQL from config')
     p_end.add_argument('--date', help='Day to close (YYYY-MM-DD). If omitted and 00:00–06:00 → closes yesterday.')
     p_end.add_argument('--out', help='Output markdown path (default: notes/work/end-of-day.md)')
-    p_end.add_argument('--taxonomy', help='Override taxonomy.yaml path')
-    p_end.add_argument('--classification-db', help='Override jira_mindmap.db path')
     p_end.set_defaults(func=cmd_end_day)
 
     return parser

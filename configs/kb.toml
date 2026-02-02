@@ -28,14 +28,3 @@ fields = [
   "labels",
   "issuetype",
 ]
-
-[taxonomy]
-# Optional: used to group Jira tasks by themes.
-# Paths can be absolute, or relative to the repo root.
-path = ""
-
-# Optional: local cache DB (issue_key -> theme_id/confidence/reason/locked).
-classification_db = ""
-
-# Tasks below this confidence are highlighted as "needs review".
-confidence_low = 0.80
