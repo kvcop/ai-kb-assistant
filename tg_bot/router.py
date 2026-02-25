@@ -2146,6 +2146,28 @@ class Router:
                     payload = f'{self.force_read_prefix}{payload}'
                 elif choice == 'none':
                     self.state.metric_inc('voice.route.none')
+        if waiting is None:
+            collect_status = self.state.collect_status(chat_id=chat_id, message_thread_id=message_thread_id)
+            if collect_status in {'active', 'pending'}:
+                item: dict[str, Any] = {
+                    'text': payload,
+                    'message_id': int(message_id or 0),
+                    'user_id': int(user_id or 0),
+                    'received_ts': float(received_ts or 0.0),
+                }
+                if attachments:
+                    item['attachments'] = list(attachments)
+                if isinstance(reply_to, dict):
+                    item['reply_to'] = dict(reply_to)
+                self.state.collect_append(chat_id=chat_id, message_thread_id=message_thread_id, item=item)
+                pending_count = len(self.state.collect_pending.get(f'{int(chat_id)}:{int(message_thread_id or 0)}', []))
+                self._send_or_edit_message(
+                    chat_id=chat_id,
+                    text=f'collect queued: {collect_status}, pending={pending_count}',
+                    ack_message_id=ack_message_id,
+                    reply_to_message_id=message_id or None,
+                )
+                return
         forced: str | None = None
         forced_reason: str | None = None
         dangerous_reason_override: str | None = None
