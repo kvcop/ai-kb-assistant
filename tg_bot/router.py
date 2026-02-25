@@ -5619,6 +5619,119 @@ class Router:
                 )
             return
 
+        if cmd == '/collect':
+            sub = (arg or '').strip().casefold()
+            if not sub:
+                reply(
+                    'Формат: /collect <start|status|done|retry|cancel>',
+                    reply_markup=None,
+                )
+                return
+            subcmd, *_ = (sub.split(maxsplit=1) + [''])
+            scope_thread_id = int(self._tg_message_thread_id() or 0)
+            scope_key = f'{int(chat_id)}:{int(scope_thread_id)}'
+
+            if subcmd == 'start':
+                item = self.state.collect_start(chat_id=chat_id, message_thread_id=scope_thread_id)
+                if item is None:
+                    reply('collect start: очередь пуста (нет pending-элементов).', reply_markup=None)
+                    return
+                item_id = item.get('id')
+                if item_id is None:
+                    reply('collect start: взят следующий item из очереди.', reply_markup=None)
+                else:
+                    reply(f'collect start: активен item {item_id}.', reply_markup=None)
+                return
+
+            if subcmd == 'status':
+                status = self.state.collect_status(chat_id=chat_id, message_thread_id=scope_thread_id)
+                pending_count = len(self.state.collect_pending.get(scope_key, []))
+                deferred_count = len(self.state.collect_deferred.get(scope_key, []))
+                reply(
+                    (
+                        f'collect status [{chat_id}:{scope_thread_id}]\n'
+                        f'- state: {status}\n'
+                        f'- pending: {pending_count}\n'
+                        f'- deferred: {deferred_count}'
+                    ),
+                    reply_markup=None,
+                )
+                return
+
+            if subcmd == 'done':
+                item = self.state.collect_complete(chat_id=chat_id, message_thread_id=scope_thread_id)
+                if item is None:
+                    reply(
+                        f'collect done: нет активного item для завершения ({self.state.collect_status(chat_id=chat_id, message_thread_id=scope_thread_id)}).',
+                        reply_markup=None,
+                    )
+                    return
+                item_id = item.get('id')
+                if item_id is None:
+                    reply('collect done: active item завершён.', reply_markup=None)
+                else:
+                    reply(f'collect done: active item {item_id} завершён.', reply_markup=None)
+                return
+
+            if subcmd == 'cancel':
+                item = self.state.collect_cancel(chat_id=chat_id, message_thread_id=scope_thread_id)
+                if item is None:
+                    reply('collect cancel: нет активного item для отмены.', reply_markup=None)
+                    return
+                item_id = item.get('id')
+                if item_id is None:
+                    reply('collect cancel: active item отменён.', reply_markup=None)
+                else:
+                    reply(f'collect cancel: active item {item_id} отменён.', reply_markup=None)
+                return
+
+            if subcmd == 'retry':
+                status = self.state.collect_status(chat_id=chat_id, message_thread_id=scope_thread_id)
+                if status == 'active':
+                    reply('collect retry: сначала завершите или отмените текущий active item.', reply_markup=None)
+                    return
+
+                item: dict[str, Any] | None = None
+                with self.state.lock:
+                    deferred = self.state.collect_deferred.get(scope_key)
+                    if not isinstance(deferred, list):
+                        deferred = []
+
+                    idx: int | None = None
+                    for i, candidate in enumerate(deferred):
+                        if isinstance(candidate, dict):
+                            idx = i
+                            item = dict(candidate)
+                            break
+
+                    if idx is None or item is None:
+                        item = None
+                    else:
+                        del deferred[idx]
+                        if deferred:
+                            self.state.collect_deferred[scope_key] = deferred
+                        else:
+                            self.state.collect_deferred.pop(scope_key, None)
+                        self.state.collect_active[scope_key] = item
+
+                if item is None:
+                    reply('collect retry: нет deferred item.', reply_markup=None)
+                    return
+
+                self.state.save()
+                item_id = item.get('id')
+                if item_id is None:
+                    reply('collect retry: активирован deferred item.', reply_markup=None)
+                else:
+                    reply(f'collect retry: deferred item {item_id} активирован.', reply_markup=None)
+                return
+
+            reply(
+                'Поддерживаются: /collect start|status|done|retry|cancel',
+                reply_markup=None,
+            )
+            return
+
         reply(
             'Не понял команду. /help',
             reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
