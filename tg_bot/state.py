@@ -171,6 +171,14 @@ class BotState:
     # scope_key -> [{message_id, user_id, received_ts, text, attachments?, reply_to?}]
     pending_followups_by_scope: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
+    # Per-scope collect queue state: one active item, queued pending items, and completed deferred items.
+    # scope_key -> {payload}
+    collect_active: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # scope_key -> [{payload}]
+    collect_pending: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # scope_key -> [{payload}]
+    collect_deferred: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
     # user-in-the-loop: blocking question asked; scope is waiting for user's answer.
     # scope_key -> {asked_ts, question, default?, ping_count, last_ping_ts, ...}
     waiting_for_user_by_scope: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -1221,6 +1229,54 @@ class BotState:
                         cleaned_pfu[sk] = cleaned_followups[-200:]
                 self.pending_followups_by_scope = cleaned_pfu
 
+            ca = data.get('collect_active') or {}
+            if isinstance(ca, dict):
+                cleaned_ca: dict[str, dict[str, Any]] = {}
+                for k, v in ca.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    if not isinstance(v, dict) or not v:
+                        continue
+                    cleaned_ca[sk] = dict(v)
+                self.collect_active = cleaned_ca
+
+            cp = data.get('collect_pending') or {}
+            if isinstance(cp, dict):
+                cleaned_cp: dict[str, list[dict[str, Any]]] = {}
+                for k, v in cp.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    if not isinstance(v, list):
+                        continue
+                    cleaned_cp_items: list[dict[str, Any]] = []
+                    for item in v:
+                        if not isinstance(item, dict):
+                            continue
+                        cleaned_cp_items.append(dict(item))
+                    if cleaned_cp_items:
+                        cleaned_cp[sk] = cleaned_cp_items[-200:]
+                self.collect_pending = cleaned_cp
+
+            cd = data.get('collect_deferred') or {}
+            if isinstance(cd, dict):
+                cleaned_cd: dict[str, list[dict[str, Any]]] = {}
+                for k, v in cd.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    if not isinstance(v, list):
+                        continue
+                    cleaned_cd_items: list[dict[str, Any]] = []
+                    for item in v:
+                        if not isinstance(item, dict):
+                            continue
+                        cleaned_cd_items.append(dict(item))
+                    if cleaned_cd_items:
+                        cleaned_cd[sk] = cleaned_cd_items[-200:]
+                self.collect_deferred = cleaned_cd
+
             wfu = data.get('waiting_for_user_by_scope') or {}
             if isinstance(wfu, dict):
                 cleaned_wfu: dict[str, dict[str, Any]] = {}
@@ -1454,6 +1510,9 @@ class BotState:
                 'pending_voice_routes_by_chat': self.pending_voice_routes_by_chat,
                 'pending_voice_routes_by_scope': self.pending_voice_routes_by_scope,
                 'pending_followups_by_scope': self.pending_followups_by_scope,
+                'collect_active': self.collect_active,
+                'collect_pending': self.collect_pending,
+                'collect_deferred': self.collect_deferred,
                 'waiting_for_user_by_scope': self.waiting_for_user_by_scope,
                 'live_chatter_last_sent_ts_by_scope': self.live_chatter_last_sent_ts_by_scope,
                 'ux_prefer_edit_delivery_by_chat': self.ux_prefer_edit_delivery_by_chat,
@@ -2704,8 +2763,164 @@ class BotState:
             items.append(item)
             if max_n > 0 and len(items) > max_n:
                 items = items[-max_n:]
-        self.pending_followups_by_scope[sk] = items
+            self.pending_followups_by_scope[sk] = items
         self.save()
+
+    def collect_status(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+    ) -> str:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        with self.lock:
+            if isinstance(self.collect_active.get(sk), dict):
+                return 'active'
+            if (self.collect_pending.get(sk) or []):
+                return 'pending'
+            if (self.collect_deferred.get(sk) or []):
+                return 'deferred'
+        return 'idle'
+
+    def collect_append(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+        item: dict[str, Any] | None,
+        max_items_per_scope: int = 200,
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        payload = dict(item)
+        if not payload:
+            return
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        max_n = max(0, int(max_items_per_scope or 0))
+        changed = False
+        with self.lock:
+            items = self.collect_pending.get(sk)
+            if not isinstance(items, list):
+                items = []
+            items.append(payload)
+            if max_n > 0 and len(items) > max_n:
+                items = items[-max_n:]
+            self.collect_pending[sk] = items
+            changed = True
+        if changed:
+            self.save()
+
+    def collect_start(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+    ) -> dict[str, Any] | None:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        started: dict[str, Any] | None = None
+        changed = False
+        with self.lock:
+            active = self.collect_active.get(sk)
+            if isinstance(active, dict) and active:
+                return dict(active)
+
+            if sk in self.collect_active:
+                self.collect_active.pop(sk, None)
+                changed = True
+
+            pending = self.collect_pending.get(sk) or []
+            if not isinstance(pending, list):
+                pending = []
+            while pending and not isinstance(pending[0], dict):
+                pending = pending[1:]
+            if not pending:
+                if sk in self.collect_pending:
+                    self.collect_pending.pop(sk, None)
+                    changed = True
+                return None
+
+            started = dict(pending.pop(0))
+            if pending:
+                self.collect_pending[sk] = pending
+            else:
+                self.collect_pending.pop(sk, None)
+            if started:
+                self.collect_active[sk] = started
+            else:
+                self.collect_active.pop(sk, None)
+            changed = True
+
+        if changed:
+            self.save()
+        return dict(started) if isinstance(started, dict) else None
+
+    def collect_complete(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+        max_deferred_per_scope: int = 200,
+    ) -> dict[str, Any] | None:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        max_n = max(0, int(max_deferred_per_scope or 0))
+        completed: dict[str, Any] | None = None
+        changed = False
+        with self.lock:
+            active = self.collect_active.pop(sk, None)
+            if not isinstance(active, dict) or not active:
+                return None if sk not in self.collect_active else None
+            deferred = self.collect_deferred.get(sk)
+            if not isinstance(deferred, list):
+                deferred = []
+            deferred.append(dict(active))
+            if max_n > 0 and len(deferred) > max_n:
+                deferred = deferred[-max_n:]
+            self.collect_deferred[sk] = deferred
+            completed = dict(active)
+            changed = True
+        if changed:
+            self.save()
+        return completed
+
+    def collect_cancel(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+    ) -> dict[str, Any] | None:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        canceled: dict[str, Any] | None = None
+        changed = False
+        with self.lock:
+            active = self.collect_active.get(sk)
+            if isinstance(active, dict):
+                canceled = dict(active)
+            if sk in self.collect_active:
+                self.collect_active.pop(sk, None)
+                changed = True
+        if changed:
+            self.save()
+        return canceled
+
+    def status(self, *, chat_id: int, message_thread_id: int = 0) -> str:
+        return self.collect_status(chat_id=chat_id, message_thread_id=message_thread_id)
+
+    def append(self, *, chat_id: int, message_thread_id: int = 0, item: dict[str, Any] | None) -> None:
+        self.collect_append(chat_id=chat_id, message_thread_id=message_thread_id, item=item)
+
+    def start(self, *, chat_id: int, message_thread_id: int = 0) -> dict[str, Any] | None:
+        return self.collect_start(chat_id=chat_id, message_thread_id=message_thread_id)
+
+    def complete(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+    ) -> dict[str, Any] | None:
+        return self.collect_complete(chat_id=chat_id, message_thread_id=message_thread_id)
+
+    def cancel(self, *, chat_id: int, message_thread_id: int = 0) -> dict[str, Any] | None:
+        return self.collect_cancel(chat_id=chat_id, message_thread_id=message_thread_id)
 
     def waiting_for_user(self, *, chat_id: int, message_thread_id: int = 0) -> dict[str, Any] | None:
         sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
