@@ -140,6 +140,9 @@ class BotConfig:
     tg_codex_parse_mode: str
     tg_uploads_dir: Path
     tg_upload_max_bytes: int
+    tg_collect_max_payload_chars: int
+    tg_collect_max_items: int
+    tg_collect_max_metadata_chars: int
     tg_voice_auto_transcribe: bool
     tg_voice_echo_transcript: bool
     tg_voice_transcribe_timeout_seconds: int
@@ -277,6 +280,9 @@ class BotConfig:
             tg_uploads_dir = (repo_root / 'tg_uploads').resolve()
         tg_upload_max_mb = max(0, _env_int('TG_UPLOAD_MAX_MB', 50))
         tg_upload_max_bytes = int(tg_upload_max_mb) * 1024 * 1024
+        tg_collect_max_payload_chars = max(100, _env_int('TG_COLLECT_MAX_PAYLOAD_CHARS', 12000))
+        tg_collect_max_items = max(0, _env_int('TG_COLLECT_MAX_ITEMS', 100))
+        tg_collect_max_metadata_chars = max(100, _env_int('TG_COLLECT_MAX_METADATA_CHARS', 2000))
 
         tg_voice_auto_transcribe = _env_bool('TG_VOICE_AUTO_TRANSCRIBE', False)
         tg_voice_echo_transcript = _env_bool('TG_VOICE_ECHO_TRANSCRIPT', False)
@@ -431,6 +437,9 @@ class BotConfig:
             tg_codex_parse_mode=tg_codex_parse_mode,
             tg_uploads_dir=tg_uploads_dir,
             tg_upload_max_bytes=tg_upload_max_bytes,
+            tg_collect_max_payload_chars=tg_collect_max_payload_chars,
+            tg_collect_max_items=tg_collect_max_items,
+            tg_collect_max_metadata_chars=tg_collect_max_metadata_chars,
             tg_voice_auto_transcribe=tg_voice_auto_transcribe,
             tg_voice_echo_transcript=tg_voice_echo_transcript,
             tg_voice_transcribe_timeout_seconds=tg_voice_transcribe_timeout_seconds,

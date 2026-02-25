@@ -178,6 +178,11 @@ class BotState:
     collect_pending: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     # scope_key -> [{payload}]
     collect_deferred: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Per-scope collect packet decisions (pending / forced) for retries and oversize control.
+    # scope_key -> {packet_id -> {status, created_ts, reasons, report, forced}}
+    collect_packet_decisions_by_scope: dict[str, dict[str, dict[str, Any]]] = field(
+        default_factory=dict
+    )
 
     # user-in-the-loop: blocking question asked; scope is waiting for user's answer.
     # scope_key -> {asked_ts, question, default?, ping_count, last_ping_ts, ...}
@@ -1277,6 +1282,48 @@ class BotState:
                         cleaned_cd[sk] = cleaned_cd_items[-200:]
                 self.collect_deferred = cleaned_cd
 
+            cpd = data.get('collect_packet_decisions_by_scope') or {}
+            if isinstance(cpd, dict):
+                cleaned_cpd: dict[str, dict[str, dict[str, Any]]] = {}
+                for k, v in cpd.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    if not isinstance(v, dict):
+                        continue
+                    per_scope: dict[str, dict[str, Any]] = {}
+                    for packet_id_raw, decision_raw in v.items():
+                        pid = str(packet_id_raw or '').strip()
+                        if not pid:
+                            continue
+                        if not isinstance(decision_raw, dict):
+                            continue
+                        status = str(decision_raw.get('status') or '').strip().lower()
+                        if status not in {'pending', 'forced'}:
+                            continue
+                        reasons_raw = decision_raw.get('reasons')
+                        if not isinstance(reasons_raw, list):
+                            reasons: list[str] = []
+                        else:
+                            reasons = [str(x).strip() for x in reasons_raw if str(x).strip()]
+                        try:
+                            created_ts = float(decision_raw.get('created_ts') or 0.0)
+                        except (TypeError, ValueError):
+                            created_ts = 0.0
+                        cleaned_decision: dict[str, Any] = {
+                            'status': status,
+                            'created_ts': created_ts,
+                            'reasons': reasons,
+                            'forced': status == 'forced',
+                        }
+                        report = decision_raw.get('report')
+                        if isinstance(report, dict):
+                            cleaned_decision['report'] = dict(report)
+                        per_scope[pid] = cleaned_decision
+                    if per_scope:
+                        cleaned_cpd[sk] = per_scope
+                self.collect_packet_decisions_by_scope = cleaned_cpd
+
             wfu = data.get('waiting_for_user_by_scope') or {}
             if isinstance(wfu, dict):
                 cleaned_wfu: dict[str, dict[str, Any]] = {}
@@ -1513,6 +1560,7 @@ class BotState:
                 'collect_active': self.collect_active,
                 'collect_pending': self.collect_pending,
                 'collect_deferred': self.collect_deferred,
+                'collect_packet_decisions_by_scope': self.collect_packet_decisions_by_scope,
                 'waiting_for_user_by_scope': self.waiting_for_user_by_scope,
                 'live_chatter_last_sent_ts_by_scope': self.live_chatter_last_sent_ts_by_scope,
                 'ux_prefer_edit_delivery_by_chat': self.ux_prefer_edit_delivery_by_chat,
@@ -2837,18 +2885,18 @@ class BotState:
                 if sk in self.collect_pending:
                     self.collect_pending.pop(sk, None)
                     changed = True
-                return None
-
-            started = dict(pending.pop(0))
-            if pending:
-                self.collect_pending[sk] = pending
+                started = None
             else:
-                self.collect_pending.pop(sk, None)
-            if started:
-                self.collect_active[sk] = started
-            else:
-                self.collect_active.pop(sk, None)
-            changed = True
+                started = dict(pending.pop(0))
+                if pending:
+                    self.collect_pending[sk] = pending
+                else:
+                    self.collect_pending.pop(sk, None)
+                if started:
+                    self.collect_active[sk] = started
+                else:
+                    self.collect_active.pop(sk, None)
+                changed = True
 
         if changed:
             self.save()
@@ -2901,6 +2949,79 @@ class BotState:
         if changed:
             self.save()
         return canceled
+
+    def collect_packet_decision(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+        packet_id: str,
+    ) -> dict[str, Any] | None:
+        """Return stored decision for a collect packet in this scope."""
+        pid = str(packet_id or '').strip()
+        if not pid:
+            return None
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        with self.lock:
+            decision = self.collect_packet_decisions_by_scope.get(sk, {}).get(pid)
+        if isinstance(decision, dict) and decision:
+            return dict(decision)
+        return None
+
+    def set_collect_packet_decision(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+        packet_id: str,
+        status: str | None,
+        reasons: list[str] | None = None,
+        report: dict[str, Any] | None = None,
+        created_ts: float | None = None,
+    ) -> None:
+        """Persist collect packet decision for retry/force handling."""
+        pid = str(packet_id or '').strip()
+        if not pid:
+            return
+
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        status_norm = str(status or '').strip().lower()
+
+        changed = False
+        with self.lock:
+            per_scope = dict(self.collect_packet_decisions_by_scope.get(sk) or {})
+
+            if status_norm not in {'pending', 'forced'}:
+                if sk in self.collect_packet_decisions_by_scope:
+                    existing = self.collect_packet_decisions_by_scope.get(sk) or {}
+                    if isinstance(existing, dict) and pid in existing:
+                        existing = dict(existing)
+                        existing.pop(pid, None)
+                        if existing:
+                            self.collect_packet_decisions_by_scope[sk] = existing
+                        else:
+                            self.collect_packet_decisions_by_scope.pop(sk, None)
+                        changed = True
+            else:
+                try:
+                    created_ts_f = float(created_ts) if created_ts is not None else 0.0
+                except (TypeError, ValueError):
+                    created_ts_f = 0.0
+                entry: dict[str, Any] = {
+                    'status': status_norm,
+                    'created_ts': created_ts_f,
+                    'forced': status_norm == 'forced',
+                    'reasons': [str(x).strip() for x in (reasons or []) if str(x).strip()],
+                }
+                if report is not None and isinstance(report, dict):
+                    entry['report'] = dict(report)
+
+                per_scope[pid] = entry
+                self.collect_packet_decisions_by_scope[sk] = per_scope
+                changed = True
+
+        if changed:
+            self.save()
 
     def status(self, *, chat_id: int, message_thread_id: int = 0) -> str:
         return self.collect_status(chat_id=chat_id, message_thread_id=message_thread_id)

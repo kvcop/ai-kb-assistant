@@ -71,3 +71,18 @@ class TestConfigParsing(unittest.TestCase):
             with patch.dict(os.environ, env, clear=False):
                 cfg = BotConfig.from_env()
                 self.assertEqual(cfg.mm_extra_channel_ids, ['a', 'b', 'c'])
+
+    def test_collect_payload_limits_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = {
+                **self._base_env(repo_root=root),
+                'TG_COLLECT_MAX_PAYLOAD_CHARS': '5555',
+                'TG_COLLECT_MAX_ITEMS': '7',
+                'TG_COLLECT_MAX_METADATA_CHARS': '777',
+            }
+            with patch.dict(os.environ, env, clear=False):
+                cfg = BotConfig.from_env()
+                self.assertEqual(cfg.tg_collect_max_payload_chars, 5555)
+                self.assertEqual(cfg.tg_collect_max_items, 7)
+                self.assertEqual(cfg.tg_collect_max_metadata_chars, 777)
