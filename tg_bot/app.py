@@ -1439,6 +1439,12 @@ def main() -> int:
             pause_state['active'] = False
             pause_state['ts'] = 0.0
 
+    def _scope_is_sleeping(*, chat_id: int, message_thread_id: int = 0) -> bool:
+        try:
+            return bool(state.is_sleeping(chat_id=chat_id, message_thread_id=int(message_thread_id or 0)))
+        except Exception:
+            return False
+
     spool_path = _queue_spool_path(cfg.state_path)
     spool_drain_remaining_by_path: dict[str, int] = {}
     spool_drain_remaining_lock = threading.Lock()
@@ -3256,7 +3262,13 @@ def main() -> int:
 
             started_any = False
             while not stop.is_set():
-                item = scheduler.try_dispatch_next(pause_active=pause_active, pause_ts=pause_ts)
+                item = scheduler.try_dispatch_next(
+                    pause_active=pause_active,
+                    pause_ts=pause_ts,
+                    scope_sleeping=lambda chat_id, message_thread_id: _scope_is_sleeping(
+                        chat_id=int(chat_id), message_thread_id=int(message_thread_id)
+                    ),
+                )
                 if item is None:
                     break
                 started_any = True

@@ -52,12 +52,33 @@ class _FakeCodexRunner:
     def log_note(self, *_: object, **__: object) -> None:
         return None
 
-    def run_with_progress(self, *, prompt: str, automation: bool, chat_id: int, **__: Any) -> str:
-        self.calls.append(('run_with_progress', {'automation': bool(automation), 'chat_id': int(chat_id), 'prompt': str(prompt)}))
+    def run_with_progress(self, *, prompt: str, automation: bool, chat_id: int, **kwargs: Any) -> str:
+        config_overrides = kwargs.get('config_overrides')
+        self.calls.append(
+            (
+                'run_with_progress',
+                {
+                    'automation': bool(automation),
+                    'chat_id': int(chat_id),
+                    'prompt': str(prompt),
+                    'config_overrides': dict(config_overrides or {}),
+                },
+            )
+        )
         return 'OK'
 
-    def run_dangerous_with_progress(self, *, prompt: str, chat_id: int, **__: Any) -> str:
-        self.calls.append(('run_dangerous_with_progress', {'chat_id': int(chat_id), 'prompt': str(prompt)}))
+    def run_dangerous_with_progress(self, *, prompt: str, chat_id: int, **kwargs: Any) -> str:
+        config_overrides = kwargs.get('config_overrides')
+        self.calls.append(
+            (
+                'run_dangerous_with_progress',
+                {
+                    'chat_id': int(chat_id),
+                    'prompt': str(prompt),
+                    'config_overrides': dict(config_overrides or {}),
+                },
+            )
+        )
         return 'OK'
 
 
@@ -164,3 +185,111 @@ class TestRouterCollectIntercept(unittest.TestCase):
             router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='hello router', message_id=333)
 
             self.assertTrue(any(name == 'run_with_progress' for name, _ in codex.calls))
+
+    def test_profile_commands_impact_codex_run_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state_path = root / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            st.set_last_codex_profile_state(
+                chat_id=1,
+                message_thread_id=7,
+                mode='read',
+                reasoning='medium',
+                model='gpt-legacy',
+            )
+
+            api = _FakeAPI()
+            codex = _FakeCodexRunner()
+            router = _mk_router(api=api, state=st, codex=codex, root=root)
+
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='/implement', message_id=500)
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='/model gpt-4.1', message_id=501)
+
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='first run', message_id=502)
+            self.assertEqual(len(codex.calls), 1)
+            run_name, run_payload = codex.calls[-1]
+            self.assertEqual(run_name, 'run_with_progress')
+            self.assertTrue(run_payload['automation'])
+            self.assertEqual(run_payload['config_overrides'].get('model'), 'gpt-4.1')
+            self.assertEqual(run_payload['config_overrides'].get('model_reasoning_effort'), 'high')
+
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='/plan', message_id=503)
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='second run', message_id=504)
+            self.assertEqual(len(codex.calls), 2)
+            run_name, run_payload = codex.calls[-1]
+            self.assertEqual(run_name, 'run_with_progress')
+            self.assertFalse(run_payload['automation'])
+            self.assertEqual(run_payload['config_overrides'].get('model'), 'gpt-4.1')
+            self.assertEqual(run_payload['config_overrides'].get('model_reasoning_effort'), 'medium')
+
+    def test_topic_without_override_uses_root_model_for_codex_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state_path = root / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            st.set_last_codex_profile_state(
+                chat_id=1,
+                message_thread_id=0,
+                mode='read',
+                model='gpt-root',
+                reasoning='medium',
+            )
+
+            api = _FakeAPI()
+            codex = _FakeCodexRunner()
+            router = _mk_router(api=api, state=st, codex=codex, root=root)
+
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='run from topic', message_id=555)
+
+            self.assertEqual(len(codex.calls), 1)
+            run_name, run_payload = codex.calls[-1]
+            self.assertEqual(run_name, 'run_with_progress')
+            self.assertEqual(run_payload['config_overrides'].get('model'), 'gpt-root')
+
+    def test_topic_default_model_keeps_root_model_in_codex_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state_path = root / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            st.set_last_codex_profile_state(
+                chat_id=1,
+                message_thread_id=0,
+                mode='read',
+                model='gpt-root',
+                reasoning='medium',
+            )
+            st.set_last_codex_profile_state(
+                chat_id=1,
+                message_thread_id=7,
+                mode='read',
+                model='gpt-topic',
+                reasoning='high',
+            )
+            api = _FakeAPI()
+            codex = _FakeCodexRunner()
+            router = _mk_router(api=api, state=st, codex=codex, root=root)
+
+            router.handle_callback(
+                chat_id=1,
+                message_thread_id=7,
+                user_id=42,
+                data='model:__default__',
+                callback_query_id='cb-default',
+                message_id=556,
+            )
+            router.handle_text(chat_id=1, message_thread_id=7, user_id=42, text='run after default', message_id=557)
+
+            self.assertEqual(len(codex.calls), 1)
+            run_name, run_payload = codex.calls[-1]
+            self.assertEqual(run_name, 'run_with_progress')
+            self.assertEqual(run_payload['config_overrides'].get('model'), 'gpt-root')

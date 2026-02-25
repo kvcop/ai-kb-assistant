@@ -184,3 +184,33 @@ class TestCollectPayload(unittest.TestCase):
             self.assertEqual(stored.get('status'), 'forced')
         finally:
             tempdir.cleanup()
+
+    def test_collect_packet_send_decision_retries_pending_without_force(self) -> None:
+        packet = self._make_packet(text='x' * 200)
+        st, tempdir = self._make_state()
+        try:
+            first = collect_packet_send_decision(
+                packet,
+                state=st,
+                max_payload_chars=20,
+                max_items=10,
+                max_metadata_chars=1000,
+                force=False,
+            )
+            self.assertEqual(first['decision'], 'pending')
+
+            second = collect_packet_send_decision(
+                packet,
+                state=st,
+                max_payload_chars=20,
+                max_items=10,
+                max_metadata_chars=1000,
+                force=False,
+            )
+            self.assertEqual(second['decision'], 'pending')
+            self.assertFalse(second['ok'])
+            stored = st.collect_packet_decision(chat_id=101, message_thread_id=2, packet_id=packet['packet_id'])
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.get('status'), 'pending')
+        finally:
+            tempdir.cleanup()

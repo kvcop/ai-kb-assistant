@@ -98,11 +98,27 @@ class ParallelScheduler(Generic[T]):
     def _is_callback(self, ev: T) -> bool:
         return str(getattr(ev, 'kind', '') or '').strip() == 'callback'
 
-    def _should_pause(self, item: QueuedItem[T], *, pause_active: bool, pause_ts: float) -> bool:
+    def _should_pause(
+        self,
+        item: QueuedItem[T],
+        *,
+        pause_active: bool,
+        pause_ts: float,
+        scope_sleeping: Callable[[int, int], bool] | None = None,
+    ) -> bool:
+        if scope_sleeping is not None:
+            try:
+                if bool(scope_sleeping(*item.scope)):
+                    return True
+            except Exception:
+                pass
+
         if not pause_active:
             return False
+
         if self._is_callback(item.event):
             return False
+
         if float(item.ts or 0.0) <= 0:
             return False
         return float(item.ts) < float(pause_ts or 0.0)
@@ -147,7 +163,13 @@ class ParallelScheduler(Generic[T]):
                     n += 1
             return n
 
-    def _apply_pause_barrier(self, *, pause_active: bool, pause_ts: float) -> None:
+    def _apply_pause_barrier(
+        self,
+        *,
+        pause_active: bool,
+        pause_ts: float,
+        scope_sleeping: Callable[[int, int], bool] | None = None,
+    ) -> None:
         if not pause_active:
             return
         if not self._main:
@@ -155,7 +177,9 @@ class ParallelScheduler(Generic[T]):
         to_pause: list[QueuedItem[T]] = []
         kept: list[QueuedItem[T]] = []
         for item in self._main:
-            if self._should_pause(item, pause_active=pause_active, pause_ts=pause_ts):
+            if not self._is_callback(item.event) and self._should_pause(
+                item, pause_active=pause_active, pause_ts=pause_ts, scope_sleeping=scope_sleeping
+            ):
                 to_pause.append(item)
             else:
                 kept.append(item)
@@ -164,12 +188,21 @@ class ParallelScheduler(Generic[T]):
         self._main = kept
         self._paused.extend(to_pause)
 
-    def _pick_best_eligible(self, items: list[QueuedItem[T]]) -> int | None:
+    def _pick_best_eligible(
+        self,
+        items: list[QueuedItem[T]],
+        *,
+        pause_active: bool,
+        pause_ts: float,
+        scope_sleeping: Callable[[int, int], bool] | None = None,
+    ) -> int | None:
         best_idx: int | None = None
         best_key: tuple[float, int] | None = None
         for idx, item in enumerate(items):
             scope = item.scope
             if scope in self._running:
+                continue
+            if self._should_pause(item, pause_active=pause_active, pause_ts=pause_ts, scope_sleeping=scope_sleeping):
                 continue
             key = (float(item.ts or 0.0), int(item.seq or 0))
             if best_key is None or key < best_key:
@@ -177,12 +210,21 @@ class ParallelScheduler(Generic[T]):
                 best_idx = idx
         return best_idx
 
-    def _pick_best_eligible_from_deque(self, items: deque[QueuedItem[T]]) -> int | None:
+    def _pick_best_eligible_from_deque(
+        self,
+        items: deque[QueuedItem[T]],
+        *,
+        pause_active: bool,
+        pause_ts: float,
+        scope_sleeping: Callable[[int, int], bool] | None = None,
+    ) -> int | None:
         best_idx: int | None = None
         best_key: tuple[float, int] | None = None
         for idx, item in enumerate(items):
             scope = item.scope
             if scope in self._running:
+                continue
+            if self._should_pause(item, pause_active=pause_active, pause_ts=pause_ts, scope_sleeping=scope_sleeping):
                 continue
             key = (float(item.ts or 0.0), int(item.seq or 0))
             if best_key is None or key < best_key:
@@ -190,7 +232,13 @@ class ParallelScheduler(Generic[T]):
                 best_idx = idx
         return best_idx
 
-    def try_dispatch_next(self, *, pause_active: bool, pause_ts: float) -> T | None:
+    def try_dispatch_next(
+        self,
+        *,
+        pause_active: bool,
+        pause_ts: float,
+        scope_sleeping: Callable[[int, int], bool] | None = None,
+    ) -> T | None:
         """Pick one runnable event and mark its scope as running.
 
         Returns the event (caller should process it) or None if nothing is runnable or slots are full.
@@ -200,10 +248,15 @@ class ParallelScheduler(Generic[T]):
                 return None
 
             # Enforce pause barrier lazily.
-            self._apply_pause_barrier(pause_active=pause_active, pause_ts=pause_ts)
+            self._apply_pause_barrier(pause_active=pause_active, pause_ts=pause_ts, scope_sleeping=scope_sleeping)
 
             # Priority first (e.g. dangerous confirms).
-            idx = self._pick_best_eligible(self._prio)
+            idx = self._pick_best_eligible(
+                self._prio,
+                pause_active=pause_active,
+                pause_ts=pause_ts,
+                scope_sleeping=scope_sleeping,
+            )
             if idx is not None:
                 item = self._prio.pop(idx)
                 self._running[item.scope] = RunningItem(item=item, started_ts=time.time())
@@ -211,7 +264,12 @@ class ParallelScheduler(Generic[T]):
 
             # When pause is lifted, resume backlog first (before "main").
             if not pause_active and self._paused:
-                didx = self._pick_best_eligible_from_deque(self._paused)
+                didx = self._pick_best_eligible_from_deque(
+                    self._paused,
+                    pause_active=pause_active,
+                    pause_ts=pause_ts,
+                    scope_sleeping=scope_sleeping,
+                )
                 if didx is not None:
                     item = self._paused[didx]
                     try:
@@ -224,7 +282,12 @@ class ParallelScheduler(Generic[T]):
                 # Paused backlog exists but all scopes are busy: do not dispatch newer items.
                 return None
 
-            idx = self._pick_best_eligible(self._main)
+            idx = self._pick_best_eligible(
+                self._main,
+                pause_active=pause_active,
+                pause_ts=pause_ts,
+                scope_sleeping=scope_sleeping,
+            )
             if idx is None:
                 return None
             item = self._main.pop(idx)

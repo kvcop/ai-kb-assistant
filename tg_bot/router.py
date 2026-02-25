@@ -41,6 +41,26 @@ def _parse_duration_seconds(raw: str) -> int | None:
     return n * mult
 
 
+def _parse_hhmm_to_timestamp(raw: str) -> float | None:
+    raw = (raw or '').strip()
+    m = _TIME_HHMM_RE.fullmatch(raw)
+    if not m:
+        return None
+    try:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+    except Exception:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+
+    now = dt.datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += dt.timedelta(days=1)
+    return target.timestamp()
+
+
 def _strip_code_fences(s: str) -> str:
     s = (s or '').strip()
     if s.startswith('```'):
@@ -112,6 +132,9 @@ _FASTTHINK_RE = re.compile(r'(?i)(?<!\w)fastthink(?!\w)')
 _FORCE_WRITE_KEYWORD_RE = re.compile(r'(?i)(?<!\w)реализуй(?!\w)')
 _URL_RE = re.compile(r'https?://\S+')
 _TIME_HHMM_RE = re.compile(r'(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)')
+_MODEL_CB_PREFIX = 'model:'
+_MODEL_CB_DEFAULT = '__default__'
+_MODEL_CB_PRESET = ('gpt-4.1', 'gpt-4.1-mini')
 
 
 def _strip_ultrathink_token(s: str) -> tuple[str, bool]:
@@ -1178,7 +1201,12 @@ class Router:
                 reasoning_effort = str(job.get('reasoning_effort') or '').strip().lower()
                 if reasoning_effort not in {'low', 'medium', 'high', 'xhigh'}:
                     reasoning_effort = 'xhigh' if (dangerous or automation) else 'medium'
+                retry_model = str(job.get('model') or '').strip()
+                if not retry_model:
+                    retry_model = str(self.state.last_codex_model_for(chat_id=chat_id, message_thread_id=message_thread_id))
                 codex_config_overrides: dict[str, object] = {'model_reasoning_effort': reasoning_effort}
+                if retry_model:
+                    codex_config_overrides['model'] = retry_model
                 use_json_progress = _env_bool('TG_CODEX_JSON_PROGRESS', False)
                 # For now: no event streaming on retries (keeps logic simpler).
                 if use_json_progress:
@@ -1252,6 +1280,8 @@ class Router:
                     message_thread_id=message_thread_id,
                     automation=automation,
                     profile_name=str(job.get('profile_name') or ''),
+                    model=retry_model,
+                    reasoning=reasoning_effort,
                 )
                 answer, reply_markup = self._prepare_codex_answer_reply(
                     chat_id=chat_id,
@@ -2445,6 +2475,7 @@ class Router:
                     payload,
                     forced=forced,
                     chat_id=chat_id,
+                    message_thread_id=message_thread_id,
                     classifier_payload=classifier_payload,
                     write_hint=reminder_write_hint,
                 )
@@ -2528,6 +2559,7 @@ class Router:
                         return
 
             resume_label = codex_resume_label(message_thread_id=message_thread_id)
+            run_model = str(self.state.last_codex_model_for(chat_id=chat_id, message_thread_id=message_thread_id))
             if dangerous:
                 automation = True
                 profile = self.codex.danger_profile or self.codex.auto_profile
@@ -2579,14 +2611,22 @@ class Router:
                         payload,
                         forced=forced,
                         chat_id=chat_id,
+                        message_thread_id=message_thread_id,
                         classifier_payload=classifier_payload,
                         write_hint=reminder_write_hint,
                     )
 
                 automation = decision.mode == 'write'
+                _, saved_profile_model, saved_profile_reasoning = self.state.last_codex_profile_state_for(
+                    chat_id=chat_id, message_thread_id=message_thread_id
+                )
+                if saved_profile_model:
+                    run_model = str(saved_profile_model)
                 reasoning_effort = self._select_reasoning_effort(
                     decision=decision, dangerous=False, automation=automation
                 )
+                if saved_profile_reasoning:
+                    reasoning_effort = str(saved_profile_reasoning)
                 if ultrathink:
                     reasoning_effort = 'xhigh'
                 elif fastthink:
@@ -3000,6 +3040,8 @@ class Router:
             use_json_progress = _env_bool('TG_CODEX_JSON_PROGRESS', False)
             repo_root, env_policy = self._codex_context(chat_id)
             codex_config_overrides: dict[str, object] = {'model_reasoning_effort': reasoning_effort}
+            if run_model:
+                codex_config_overrides['model'] = run_model
             codex_config_overrides.update(self._codex_mcp_config_overrides(chat_id=chat_id, repo_root=repo_root))
 
             # Crash recovery: persist the current Codex job before starting the run. If the bot is restarted
@@ -3022,6 +3064,7 @@ class Router:
                     'ack_message_id': int(ack_id or 0),
                     'message_thread_id': int(message_thread_id or 0),
                     'user_id': int(user_id or 0),
+                    'model': run_model,
                     'tg_chat': dict(tg_chat) if isinstance(tg_chat, dict) else None,
                     'tg_user': dict(tg_user) if isinstance(tg_user, dict) else None,
                     'created_ts': float(now_ts),
@@ -3095,6 +3138,7 @@ class Router:
                         'ack_message_id': int(ack_id or 0),
                         'message_thread_id': int(message_thread_id or 0),
                         'user_id': int(user_id or 0),
+                        'model': run_model,
                         'tg_chat': dict(tg_chat) if isinstance(tg_chat, dict) else None,
                         'tg_user': dict(tg_user) if isinstance(tg_user, dict) else None,
                         'created_ts': float(now_ts),
@@ -3137,6 +3181,8 @@ class Router:
                 message_thread_id=message_thread_id,
                 automation=automation,
                 profile_name=profile.name,
+                model=run_model,
+                reasoning=reasoning_effort,
             )
 
             answer_text = str(answer) if answer is not None else ''
@@ -3532,6 +3578,40 @@ class Router:
 
         multi_tenant = int(self.owner_chat_id or 0) != 0
         is_owner = self._is_owner_chat(chat_id)
+
+        if data.startswith(_MODEL_CB_PREFIX):
+            if int(chat_id) < 0:
+                self._send_message(
+                    chat_id=chat_id,
+                    text='⛔️ Эта кнопка доступна только в личке.',
+                    reply_to_message_id=message_id or None,
+                )
+                return
+            if multi_tenant and not is_owner:
+                self._send_message(
+                    chat_id=chat_id,
+                    text='⛔️ Эта кнопка доступна только в owner-чате.',
+                    reply_to_message_id=message_id or None,
+                )
+                return
+
+            raw_model = data[len(_MODEL_CB_PREFIX) :].strip()
+            selected_model = '' if not raw_model or raw_model == _MODEL_CB_DEFAULT else raw_model
+            scope_thread_id = int(self._tg_message_thread_id() or 0)
+            self.state.set_last_codex_profile_state(
+                chat_id=chat_id,
+                message_thread_id=scope_thread_id,
+                mode=self.state.last_codex_mode_for(chat_id=chat_id, message_thread_id=scope_thread_id),
+                reasoning=self.state.last_codex_reasoning_for(chat_id=chat_id, message_thread_id=scope_thread_id),
+                model=selected_model,
+            )
+            model_label = selected_model if isinstance(selected_model, str) and selected_model else '<default>'
+            self._send_message(
+                chat_id=chat_id,
+                text=f'✅ Модель для scope {chat_id}:{scope_thread_id} сохранена: {model_label}',
+                reply_to_message_id=message_id or None,
+            )
+            return
 
         if multi_tenant and not is_owner:
             allowed = {
@@ -4278,9 +4358,15 @@ class Router:
 
                 automation = self.state.last_codex_automation_for(chat_id, message_thread_id=message_thread_id)
                 profile_name = self.state.last_codex_profile_for(chat_id, message_thread_id=message_thread_id)
+                profile_model = self.state.last_codex_model_for(chat_id=chat_id, message_thread_id=message_thread_id)
+                profile_reasoning = self.state.last_codex_reasoning_for(
+                    chat_id=chat_id, message_thread_id=message_thread_id
+                )
                 repo_root, env_policy = self._codex_context(chat_id)
                 session_key = self._codex_session_key(chat_id=chat_id, message_thread_id=message_thread_id)
-                codex_config_overrides: dict[str, object] = {'model_reasoning_effort': 'low'}
+                codex_config_overrides: dict[str, object] = {'model_reasoning_effort': profile_reasoning}
+                if profile_model:
+                    codex_config_overrides['model'] = profile_model
                 codex_config_overrides.update(self._codex_mcp_config_overrides(chat_id=chat_id, repo_root=repo_root))
                 answer = self.codex.run_followup_by_profile_name(
                     prompt=wrapped,
@@ -4297,6 +4383,8 @@ class Router:
                     message_thread_id=message_thread_id,
                     automation=automation,
                     profile_name=profile_name,
+                    model=profile_model,
+                    reasoning=profile_reasoning,
                 )
 
                 stop_hb.set()
@@ -4665,7 +4753,7 @@ class Router:
         arg = ' '.join(parts[1:]).strip() if len(parts) > 1 else ''
         rt = reply_to_message_id
 
-        from .keyboards import help_menu
+        from .keyboards import inline_keyboard, help_menu
 
         def reply(
             msg: str,
@@ -4757,6 +4845,11 @@ class Router:
                     '- /ask <текст> — отправить запрос в Codex (в группах: /ask@BotName <текст>)\n'
                     '- /lunch — пауза 60 минут\n'
                     '- /mute 30m|2h|1d — пауза\n'
+                    '- /sleep [show|HH:MM|0] — режим сна по scope\n'
+                    '- /plan — профиль: read (default reasoning=medium)\n'
+                    '- /implement — профиль: write (reasoning=high)\n'
+                    '- /review — профиль: read (reasoning=high)\n'
+                    '- /model <name> — override-модель для этого scope\n'
                     '- /back — снять паузу\n'
                     '- /gentle [on|off|4h] — щадящий режим\n'
                     '- /settings — тумблеры UX\n'
@@ -4979,8 +5072,10 @@ class Router:
             base = self.watcher.build_status_text(dt.datetime.now(), self.state)
             gentle = 'ON' if self.state.is_gentle_active() else 'OFF'
             snooze = 'ON' if self.state.is_snoozed() else 'OFF'
+            scope_thread_id = int(self._tg_message_thread_id() or 0)
+            sleep = 'ON' if self.state.is_sleeping(chat_id=chat_id, message_thread_id=scope_thread_id) else 'OFF'
             reply(
-                (f'📌 Статус\n{base}\nGentle: {gentle}\nSnooze: {snooze}'),
+                (f'📌 Статус\n{base}\nGentle: {gentle}\nSnooze: {snooze}\nSleep: {sleep}'),
                 reply_markup=help_menu(gentle_active=self.state.is_gentle_active()) if int(chat_id) > 0 else None,
             )
             return
@@ -5549,6 +5644,76 @@ class Router:
             )
             return
 
+        if cmd == '/sleep':
+            self._handle_sleep_cmd(chat_id=chat_id, arg=arg, reply_to_message_id=rt, ack_message_id=ack_message_id)
+            return
+
+        if cmd in {'/plan', '/implement', '/review'}:
+            scope_thread_id = int(self._tg_message_thread_id() or 0)
+            if cmd == '/implement':
+                mode = 'write'
+                reasoning = 'high'
+                profile_name = 'auto'
+            else:
+                mode = 'read'
+                reasoning = 'high' if cmd == '/review' else 'medium'
+                profile_name = 'chat'
+            self.state.set_last_codex_profile_state(
+                chat_id=chat_id,
+                message_thread_id=scope_thread_id,
+                mode=mode,
+                reasoning=reasoning,
+                profile_name=profile_name,
+            )
+            reply(
+                f'✅ Профиль сохранён: mode={mode}, reasoning={reasoning}.\n'
+                f'Применится к следующему запуску в scope={chat_id}:{scope_thread_id}.',
+                reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+            )
+            return
+
+        if cmd == '/model':
+            scope_thread_id = int(self._tg_message_thread_id() or 0)
+            model = arg.strip()
+            if not model:
+                current_model = self.state.last_codex_model_for(
+                    chat_id=chat_id, message_thread_id=scope_thread_id
+                )
+                scope_model = current_model or '<default>'
+                menu_rows: list[list[tuple[str, str]]] = [
+                    [('🧩 По умолчанию', f'{_MODEL_CB_PREFIX}{_MODEL_CB_DEFAULT}')]
+                ]
+                current_in_rows = False
+                for preset in _MODEL_CB_PRESET:
+                    label = f'✅ {preset}' if preset == scope_model else preset
+                    if preset == scope_model:
+                        current_in_rows = True
+                    menu_rows.append([(label, f'{_MODEL_CB_PREFIX}{preset}')])
+                if current_model and not current_in_rows:
+                    menu_rows.append([(f'✅ {current_model}', f'{_MODEL_CB_PREFIX}{current_model}')])
+                reply(
+                    'ℹ️ Текущий профиль:\n'
+                    f'- scope: {chat_id}:{scope_thread_id}\n'
+                    f'- mode: {self.state.last_codex_mode_for(chat_id=chat_id, message_thread_id=scope_thread_id)}\n'
+                    f'- reasoning: {self.state.last_codex_reasoning_for(chat_id=chat_id, message_thread_id=scope_thread_id)}\n'
+                    f'- model: {scope_model}',
+                    reply_markup=inline_keyboard(menu_rows),
+                )
+                return
+
+            self.state.set_last_codex_profile_state(
+                chat_id=chat_id,
+                message_thread_id=scope_thread_id,
+                mode=self.state.last_codex_mode_for(chat_id=chat_id, message_thread_id=scope_thread_id),
+                reasoning=self.state.last_codex_reasoning_for(chat_id=chat_id, message_thread_id=scope_thread_id),
+                model=model,
+            )
+            reply(
+                f'✅ Модель для scope {chat_id}:{scope_thread_id} сохранена: {model}',
+                reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+            )
+            return
+
         if cmd == '/mute':
             sec = _parse_duration_seconds(arg) if arg else None
             if not sec:
@@ -5737,6 +5902,66 @@ class Router:
             reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
         )
 
+    def _handle_sleep_cmd(
+        self,
+        *,
+        chat_id: int,
+        arg: str,
+        reply_to_message_id: int | None = None,
+        ack_message_id: int = 0,
+    ) -> None:
+        from .keyboards import help_menu
+
+        rt = reply_to_message_id
+        thread_id = int(self._tg_message_thread_id() or 0)
+        arg = (arg or '').strip().lower()
+
+        if not arg or arg == 'show':
+            sleep_until_ts = self.state.sleep_until(chat_id=chat_id, message_thread_id=thread_id)
+            if sleep_until_ts:
+                text = f'😴 Sleep: ON до {_fmt_dt(sleep_until_ts)}'
+            else:
+                text = '😴 Sleep: OFF'
+            self._send_or_edit_message(
+                chat_id=chat_id,
+                text=text,
+                ack_message_id=ack_message_id,
+                reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+                reply_to_message_id=rt,
+            )
+            return
+
+        if arg in {'off', '0'}:
+            self.state.clear_sleep(chat_id=chat_id, message_thread_id=thread_id)
+            self._send_or_edit_message(
+                chat_id=chat_id,
+                text='😴 Sleep: OFF.',
+                ack_message_id=ack_message_id,
+                reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+                reply_to_message_id=rt,
+            )
+            return
+
+        until_ts = _parse_hhmm_to_timestamp(arg)
+        if until_ts is None:
+            self._send_or_edit_message(
+                chat_id=chat_id,
+                text='Неверный формат времени. Пример: /sleep 23:45 или /sleep 0.',
+                ack_message_id=ack_message_id,
+                reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+                reply_to_message_id=rt,
+            )
+            return
+
+        self.state.set_sleep_until(chat_id=chat_id, message_thread_id=thread_id, until_ts=until_ts)
+        self._send_or_edit_message(
+            chat_id=chat_id,
+            text=f'😴 Ок. Sleep установлен до {_fmt_dt(until_ts)}.',
+            ack_message_id=ack_message_id,
+            reply_markup=help_menu(gentle_active=self.state.is_gentle_active()),
+            reply_to_message_id=rt,
+        )
+
     def _handle_gentle_cmd(
         self,
         *,
@@ -5852,6 +6077,7 @@ class Router:
         *,
         forced: str | None,
         chat_id: int,
+        message_thread_id: int = 0,
         classifier_payload: str | None = None,
         write_hint: bool = False,
     ) -> RouteDecision:
@@ -5876,6 +6102,25 @@ class Router:
 
         # Hybrid: try classifier, fallback to heuristic.
         if mode is None:
+            profile_mode, _, _ = self.state.last_codex_profile_state_for(
+                chat_id=chat_id, message_thread_id=message_thread_id
+            )
+            if profile_mode:
+                mode = profile_mode
+                source = 'profile'
+                return _record(
+                    RouteDecision(
+                        mode=mode,
+                        confidence=1.0,
+                        complexity='medium',
+                        reason='profile',
+                        needs_dangerous=needs_dangerous,
+                        dangerous_reason=str(dangerous_hint or '').strip(),
+                        raw={},
+                    ),
+                    source=source,
+                )
+
             if self.router_mode in {'codex', 'hybrid'}:
                 decision = self._classify_with_codex(
                     chat_id=chat_id, payload=classify_payload, dangerous_hint=dangerous_hint

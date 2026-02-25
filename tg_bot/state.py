@@ -33,6 +33,39 @@ def _scope_key(*, chat_id: int, message_thread_id: int = 0) -> str:
     return f'{int(chat_id)}:{int(message_thread_id or 0)}'
 
 
+def _normalize_scope_key(raw: object) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    if ':' in s:
+        a, b = s.split(':', 1)
+        try:
+            cid = int(a.strip())
+            tid = int(b.strip() or 0)
+        except Exception:
+            return None
+        if cid == 0:
+            return None
+        return _scope_key(chat_id=cid, message_thread_id=tid)
+    try:
+        cid = int(s)
+    except Exception:
+        return None
+    if cid == 0:
+        return None
+    return _scope_key(chat_id=cid, message_thread_id=0)
+
+
+def _normalize_codex_mode(raw: object) -> str:
+    v = str(raw or '').strip().casefold()
+    return v if v in {'read', 'write'} else ''
+
+
+def _normalize_codex_reasoning(raw: object) -> str:
+    v = str(raw or '').strip().casefold()
+    return v if v in {'low', 'medium', 'high', 'xhigh'} else ''
+
+
 @dataclass
 class BotState:
     """Persistent bot state (JSON file).
@@ -41,6 +74,7 @@ class BotState:
     - keep Telegram polling offset
     - track last user activity and watcher ping stages
     - support snooze (mute/lunch)
+    - support sleep_until per scope (chat_id:thread_id)
     - support gentle mode ("щадящий режим")
     - keep a small ring-buffer of recent bot events for Codex context injection
     """
@@ -60,6 +94,7 @@ class BotState:
     last_user_msg_ts_by_chat: dict[str, float] = field(default_factory=dict)
     snooze_until_ts: float = 0.0
     snooze_kind: str = ''
+    sleep_until_by_scope: dict[str, float] = field(default_factory=dict)
 
     # Gentle mode ("щадящий режим")
     gentle_until_ts: float = 0.0
@@ -94,17 +129,26 @@ class BotState:
     last_codex_ts: float = 0.0
     last_codex_automation: bool = False
     last_codex_profile: str = ''  # "chat" | "auto" | "danger" (best-effort)
+    last_codex_mode: str = ''  # "read" | "write" (best-effort)
+    last_codex_model: str = ''  # Codex model override (best-effort)
+    last_codex_reasoning: str = ''  # "low" | "medium" | "high" | "xhigh" (best-effort)
 
     # Per-chat Codex bookkeeping (prevents cross-chat leakage in prompt injection / follow-ups)
     last_codex_ts_by_chat: dict[str, float] = field(default_factory=dict)  # chat_id -> ts
     last_codex_automation_by_chat: dict[str, bool] = field(default_factory=dict)  # chat_id -> bool
     last_codex_profile_by_chat: dict[str, str] = field(default_factory=dict)  # chat_id -> profile_name
+    last_codex_mode_by_chat: dict[str, str] = field(default_factory=dict)  # chat_id -> mode
+    last_codex_model_by_chat: dict[str, str] = field(default_factory=dict)  # chat_id -> model
+    last_codex_reasoning_by_chat: dict[str, str] = field(default_factory=dict)  # chat_id -> reasoning
 
     # Per-scope Codex bookkeeping (Telegram topics/threads: chat_id + message_thread_id).
     # scope_key ("<chat_id>:<thread_id>") -> value
     last_codex_ts_by_scope: dict[str, float] = field(default_factory=dict)
     last_codex_automation_by_scope: dict[str, bool] = field(default_factory=dict)
     last_codex_profile_by_scope: dict[str, str] = field(default_factory=dict)
+    last_codex_mode_by_scope: dict[str, str] = field(default_factory=dict)  # scope_key -> mode
+    last_codex_model_by_scope: dict[str, str] = field(default_factory=dict)  # scope_key -> model
+    last_codex_reasoning_by_scope: dict[str, str] = field(default_factory=dict)  # scope_key -> reasoning
 
     # Graceful restart coordination.
     # We persist the flag so poll/worker threads can coordinate, but clear it on startup.
@@ -253,6 +297,21 @@ class BotState:
                 self.last_user_msg_ts_by_chat = cleaned_lut
             self.snooze_until_ts = float(data.get('snooze_until_ts') or 0.0)
             self.snooze_kind = str(data.get('snooze_kind') or '')
+            sleep_map = data.get('sleep_until_by_scope') or {}
+            if isinstance(sleep_map, dict):
+                cleaned_sleep_until: dict[str, float] = {}
+                for k, v in sleep_map.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    try:
+                        ts = float(v or 0.0)
+                    except Exception:
+                        ts = 0.0
+                    if ts > 0:
+                        cleaned_sleep_until[sk] = ts
+                if cleaned_sleep_until:
+                    self.sleep_until_by_scope = cleaned_sleep_until
 
             self.gentle_until_ts = float(data.get('gentle_until_ts') or 0.0)
             self.gentle_reason = str(data.get('gentle_reason') or '')
@@ -327,6 +386,9 @@ class BotState:
             self.last_codex_ts = float(data.get('last_codex_ts') or 0.0)
             self.last_codex_automation = bool(data.get('last_codex_automation') or False)
             self.last_codex_profile = str(data.get('last_codex_profile') or '')
+            self.last_codex_mode = _normalize_codex_mode(data.get('last_codex_mode'))
+            self.last_codex_model = str(data.get('last_codex_model') or '').strip()
+            self.last_codex_reasoning = _normalize_codex_reasoning(data.get('last_codex_reasoning'))
 
             lct = data.get('last_codex_ts_by_chat') or {}
             if isinstance(lct, dict):
@@ -364,6 +426,48 @@ class BotState:
                     cleaned_lcp[chat_key] = name
                 self.last_codex_profile_by_chat = cleaned_lcp
 
+            lcm = data.get('last_codex_mode_by_chat') or {}
+            if isinstance(lcm, dict):
+                cleaned_lcm: dict[str, str] = {}
+                for k, v in lcm.items():
+                    try:
+                        chat_key = str(int(k))
+                    except Exception:
+                        continue
+                    mode = _normalize_codex_mode(v)
+                    if not mode:
+                        continue
+                    cleaned_lcm[chat_key] = mode
+                self.last_codex_mode_by_chat = cleaned_lcm
+
+            lmc = data.get('last_codex_model_by_chat') or {}
+            if isinstance(lmc, dict):
+                cleaned_lmc: dict[str, str] = {}
+                for k, v in lmc.items():
+                    try:
+                        chat_key = str(int(k))
+                    except Exception:
+                        continue
+                    model = str(v or '').strip()
+                    if not model:
+                        continue
+                    cleaned_lmc[chat_key] = model
+                self.last_codex_model_by_chat = cleaned_lmc
+
+            lcr = data.get('last_codex_reasoning_by_chat') or {}
+            if isinstance(lcr, dict):
+                cleaned_lcr: dict[str, str] = {}
+                for k, v in lcr.items():
+                    try:
+                        chat_key = str(int(k))
+                    except Exception:
+                        continue
+                    reasoning = _normalize_codex_reasoning(v)
+                    if not reasoning:
+                        continue
+                    cleaned_lcr[chat_key] = reasoning
+                self.last_codex_reasoning_by_chat = cleaned_lcr
+
             # Best-effort migration from legacy single-chat fields.
             if self.last_chat_id and self.last_codex_ts and not self.last_codex_ts_by_chat:
                 self.last_codex_ts_by_chat[str(int(self.last_chat_id))] = float(self.last_codex_ts)
@@ -381,28 +485,6 @@ class BotState:
                 if chat_key in self.last_codex_profile_by_chat:
                     continue
                 self.last_codex_profile_by_chat[chat_key] = 'auto' if bool(is_auto) else 'chat'
-
-            def _normalize_scope_key(raw: object) -> str | None:
-                if not isinstance(raw, str) or not raw.strip():
-                    return None
-                s = raw.strip()
-                if ':' in s:
-                    a, b = s.split(':', 1)
-                    try:
-                        cid = int(a.strip())
-                        tid = int(b.strip() or 0)
-                    except Exception:
-                        return None
-                    if cid == 0:
-                        return None
-                    return _scope_key(chat_id=cid, message_thread_id=tid)
-                try:
-                    cid = int(s)
-                except Exception:
-                    return None
-                if cid == 0:
-                    return None
-                return _scope_key(chat_id=cid, message_thread_id=0)
 
             scope_ts = data.get('last_codex_ts_by_scope') or {}
             if isinstance(scope_ts, dict):
@@ -442,6 +524,45 @@ class BotState:
                     cleaned_scope_profile[sk] = name
                 self.last_codex_profile_by_scope = cleaned_scope_profile
 
+            scope_mode = data.get('last_codex_mode_by_scope') or {}
+            if isinstance(scope_mode, dict):
+                cleaned_scope_mode: dict[str, str] = {}
+                for k, v in scope_mode.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    mode = _normalize_codex_mode(v)
+                    if not mode:
+                        continue
+                    cleaned_scope_mode[sk] = mode
+                self.last_codex_mode_by_scope = cleaned_scope_mode
+
+            scope_model = data.get('last_codex_model_by_scope') or {}
+            if isinstance(scope_model, dict):
+                cleaned_scope_model: dict[str, str] = {}
+                for k, v in scope_model.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    model = str(v or '').strip()
+                    if not model:
+                        continue
+                    cleaned_scope_model[sk] = model
+                self.last_codex_model_by_scope = cleaned_scope_model
+
+            scope_reasoning = data.get('last_codex_reasoning_by_scope') or {}
+            if isinstance(scope_reasoning, dict):
+                cleaned_scope_reasoning: dict[str, str] = {}
+                for k, v in scope_reasoning.items():
+                    sk = _normalize_scope_key(k)
+                    if not sk:
+                        continue
+                    reasoning = _normalize_codex_reasoning(v)
+                    if not reasoning:
+                        continue
+                    cleaned_scope_reasoning[sk] = reasoning
+                self.last_codex_reasoning_by_scope = cleaned_scope_reasoning
+
             # Best-effort migration: if scope-level maps are missing, treat chat-level maps as "<chat_id>:0".
             if not self.last_codex_ts_by_scope and self.last_codex_ts_by_chat:
                 self.last_codex_ts_by_scope = {
@@ -459,60 +580,80 @@ class BotState:
                     for chat_key, name in self.last_codex_profile_by_chat.items()
                     if str(name or '').strip()
                 }
+            if not self.last_codex_mode_by_scope and self.last_codex_mode_by_chat:
+                self.last_codex_mode_by_scope = {
+                    _scope_key(chat_id=int(chat_key), message_thread_id=0): str(mode)
+                    for chat_key, mode in self.last_codex_mode_by_chat.items()
+                }
+            if not self.last_codex_model_by_scope and self.last_codex_model_by_chat:
+                self.last_codex_model_by_scope = {
+                    _scope_key(chat_id=int(chat_key), message_thread_id=0): str(model)
+                    for chat_key, model in self.last_codex_model_by_chat.items()
+                }
+            if not self.last_codex_reasoning_by_scope and self.last_codex_reasoning_by_chat:
+                self.last_codex_reasoning_by_scope = {
+                    _scope_key(chat_id=int(chat_key), message_thread_id=0): str(reasoning)
+                    for chat_key, reasoning in self.last_codex_reasoning_by_chat.items()
+                }
 
-            self.restart_pending = bool(data.get('restart_pending') or False)
-            self.restart_requested_ts = float(data.get('restart_requested_ts') or 0.0)
-            self.restart_shutting_down_ts = float(data.get('restart_shutting_down_ts') or 0.0)
-            self.restart_requested_chat_id = int(data.get('restart_requested_chat_id') or 0)
-            self.restart_requested_message_thread_id = int(data.get('restart_requested_message_thread_id') or 0)
-            self.restart_requested_user_id = int(data.get('restart_requested_user_id') or 0)
-            self.restart_requested_message_id = int(data.get('restart_requested_message_id') or 0)
-            self.restart_requested_ack_message_id = int(data.get('restart_requested_ack_message_id') or 0)
+            if not self.last_codex_mode and self.last_codex_profile:
+                self.last_codex_mode = 'write' if str(self.last_codex_profile).strip().casefold() in {'auto', 'danger'} else 'read'
+            if not self.last_codex_mode and self.last_codex_automation:
+                self.last_codex_mode = 'write'
+            if not self.last_codex_mode:
+                self.last_codex_mode = 'read'
 
-            pa = data.get('pending_attachments_by_chat') or {}
-            if isinstance(pa, dict):
-                cleaned_pa: dict[str, list[dict[str, Any]]] = {}
-                for k, v in pa.items():
+        self.restart_pending = bool(data.get('restart_pending') or False)
+        self.restart_requested_ts = float(data.get('restart_requested_ts') or 0.0)
+        self.restart_shutting_down_ts = float(data.get('restart_shutting_down_ts') or 0.0)
+        self.restart_requested_chat_id = int(data.get('restart_requested_chat_id') or 0)
+        self.restart_requested_message_thread_id = int(data.get('restart_requested_message_thread_id') or 0)
+        self.restart_requested_user_id = int(data.get('restart_requested_user_id') or 0)
+        self.restart_requested_message_id = int(data.get('restart_requested_message_id') or 0)
+        self.restart_requested_ack_message_id = int(data.get('restart_requested_ack_message_id') or 0)
+
+        pa = data.get('pending_attachments_by_chat') or {}
+        if isinstance(pa, dict):
+            cleaned_pa: dict[str, list[dict[str, Any]]] = {}
+            for k, v in pa.items():
+                try:
+                    chat_key = str(int(k))
+                except Exception:
+                    continue
+                if not isinstance(v, list):
+                    continue
+                cleaned_pa_items: list[dict[str, Any]] = []
+                for item in v:
+                    if not isinstance(item, dict):
+                        continue
+                    path_raw = item.get('path')
+                    name_raw = item.get('name')
+                    if not isinstance(path_raw, str) or not path_raw.strip():
+                        continue
+                    path_s = path_raw.strip()
+                    name_s = name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() else Path(path_s).name
+                    kind = item.get('kind')
+                    kind_s = str(kind or '').strip()[:32]
                     try:
-                        chat_key = str(int(k))
+                        size_bytes = int(item.get('size_bytes') or 0)
                     except Exception:
-                        continue
-                    if not isinstance(v, list):
-                        continue
-                    cleaned_pa_items: list[dict[str, Any]] = []
-                    for item in v:
-                        if not isinstance(item, dict):
-                            continue
-                        path_raw = item.get('path')
-                        name_raw = item.get('name')
-                        if not isinstance(path_raw, str) or not path_raw.strip():
-                            continue
-                        path_s = path_raw.strip()
-                        name_s = (
-                            name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() else Path(path_s).name
-                        )
-                        kind = item.get('kind')
-                        kind_s = str(kind or '').strip()[:32]
-                        try:
-                            size_bytes = int(item.get('size_bytes') or 0)
-                        except Exception:
-                            size_bytes = 0
-                        try:
-                            ts = float(item.get('ts') or 0.0)
-                        except Exception:
-                            ts = 0.0
-                        cleaned_pa_items.append(
-                            {
-                                'path': path_s,
-                                'name': name_s.strip(),
-                                'kind': kind_s,
-                                'size_bytes': size_bytes,
-                                'ts': ts,
-                            }
-                        )
-                    if cleaned_pa_items:
-                        cleaned_pa[chat_key] = cleaned_pa_items
-                self.pending_attachments_by_chat = cleaned_pa
+                        size_bytes = 0
+                    try:
+                        ts = float(item.get('ts') or 0.0)
+                    except Exception:
+                        ts = 0.0
+                    cleaned_pa_items.append(
+                        {
+                            'path': path_s,
+                            'name': name_s.strip(),
+                            'kind': kind_s,
+                            'size_bytes': size_bytes,
+                            'ts': ts,
+                        }
+                    )
+                if cleaned_pa_items:
+                    cleaned_pa[chat_key] = cleaned_pa_items
+            self.pending_attachments_by_chat = cleaned_pa
 
             pas = data.get('pending_attachments_by_scope') or {}
             if isinstance(pas, dict):
@@ -873,6 +1014,7 @@ class BotState:
                         'profile_name',
                         'exec_mode',
                         'reason',
+                        'model',
                         'message_id',
                         'user_id',
                         'created_ts',
@@ -906,6 +1048,7 @@ class BotState:
                         'profile_name',
                         'exec_mode',
                         'reason',
+                        'model',
                         'reasoning_effort',
                         'defer_reason',
                         'message_id',
@@ -1508,6 +1651,7 @@ class BotState:
                 'last_user_msg_ts_by_chat': self.last_user_msg_ts_by_chat,
                 'snooze_until_ts': self.snooze_until_ts,
                 'snooze_kind': self.snooze_kind,
+                'sleep_until_by_scope': self.sleep_until_by_scope,
                 'gentle_until_ts': self.gentle_until_ts,
                 'gentle_reason': self.gentle_reason,
                 'mute_events_ts': self.mute_events_ts,
@@ -1527,12 +1671,21 @@ class BotState:
                 'last_codex_ts': self.last_codex_ts,
                 'last_codex_automation': self.last_codex_automation,
                 'last_codex_profile': self.last_codex_profile,
+                'last_codex_mode': self.last_codex_mode,
+                'last_codex_model': self.last_codex_model,
+                'last_codex_reasoning': self.last_codex_reasoning,
                 'last_codex_ts_by_chat': self.last_codex_ts_by_chat,
                 'last_codex_automation_by_chat': self.last_codex_automation_by_chat,
                 'last_codex_profile_by_chat': self.last_codex_profile_by_chat,
+                'last_codex_mode_by_chat': self.last_codex_mode_by_chat,
+                'last_codex_model_by_chat': self.last_codex_model_by_chat,
+                'last_codex_reasoning_by_chat': self.last_codex_reasoning_by_chat,
                 'last_codex_ts_by_scope': self.last_codex_ts_by_scope,
                 'last_codex_automation_by_scope': self.last_codex_automation_by_scope,
                 'last_codex_profile_by_scope': self.last_codex_profile_by_scope,
+                'last_codex_mode_by_scope': self.last_codex_mode_by_scope,
+                'last_codex_model_by_scope': self.last_codex_model_by_scope,
+                'last_codex_reasoning_by_scope': self.last_codex_reasoning_by_scope,
                 'restart_pending': self.restart_pending,
                 'restart_requested_ts': self.restart_requested_ts,
                 'restart_shutting_down_ts': self.restart_shutting_down_ts,
@@ -2489,6 +2642,56 @@ class BotState:
             self.snooze_kind = (kind or 'mute').strip()[:32]
         self.save()
 
+    def sleep_until(self, *, chat_id: int, message_thread_id: int = 0) -> float:
+        key = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        now = _now_ts()
+        changed = False
+        ts = 0.0
+        with self.lock:
+            ts = float(self.sleep_until_by_scope.get(key) or 0.0)
+            if ts <= 0:
+                return 0.0
+            if ts <= now:
+                self.sleep_until_by_scope.pop(key, None)
+                ts = 0.0
+                changed = True
+        if changed:
+            self.save()
+        return ts
+
+    def set_sleep_until(self, *, chat_id: int, message_thread_id: int = 0, until_ts: float = 0.0) -> None:
+        key = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        try:
+            ts = float(until_ts)
+        except Exception:
+            ts = 0.0
+        if ts < 0:
+            ts = 0.0
+        changed = False
+        with self.lock:
+            if ts <= 0:
+                if key in self.sleep_until_by_scope:
+                    self.sleep_until_by_scope.pop(key, None)
+                    changed = True
+            elif self.sleep_until_by_scope.get(key) != ts:
+                self.sleep_until_by_scope[key] = ts
+                changed = True
+        if changed:
+            self.save()
+
+    def clear_sleep(self, *, chat_id: int, message_thread_id: int = 0) -> None:
+        key = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        changed = False
+        with self.lock:
+            if key in self.sleep_until_by_scope:
+                self.sleep_until_by_scope.pop(key, None)
+                changed = True
+        if changed:
+            self.save()
+
+    def is_sleeping(self, *, chat_id: int, message_thread_id: int = 0) -> bool:
+        return self.sleep_until(chat_id=chat_id, message_thread_id=message_thread_id) > 0.0
+
     def clear_snooze(self) -> None:
         with self.lock:
             self.snooze_until_ts = 0.0
@@ -2708,6 +2911,68 @@ class BotState:
                 auto = bool(self.last_codex_automation_by_chat.get(key) or auto)
             return 'auto' if auto else 'chat'
 
+    def last_codex_mode_for(self, chat_id: int, message_thread_id: int = 0) -> str:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        key = str(int(chat_id))
+        mode = ''
+        with self.lock:
+            mode = _normalize_codex_mode(self.last_codex_mode_by_scope.get(sk))
+            if not mode and int(message_thread_id or 0) == 0:
+                mode = _normalize_codex_mode(self.last_codex_mode_by_chat.get(key))
+            if not mode:
+                mode = _normalize_codex_mode(self.last_codex_mode)
+            if mode:
+                return mode
+        profile = str(self.last_codex_profile_for(chat_id=chat_id, message_thread_id=message_thread_id)).strip().casefold()
+        return 'write' if profile in {'auto', 'danger'} else 'read'
+
+    def _resolved_codex_model_for(self, *, chat_id: int, message_thread_id: int = 0) -> str:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        root_sk = _scope_key(chat_id=int(chat_id), message_thread_id=0)
+        key = str(int(chat_id))
+        model = str(self.last_codex_model_by_scope.get(sk) or '').strip()
+        if not model and sk != root_sk:
+            model = str(self.last_codex_model_by_scope.get(root_sk) or '').strip()
+        if not model:
+            model = str(self.last_codex_model_by_chat.get(key) or '').strip()
+        if not model:
+            model = str(self.last_codex_model or '').strip()
+        return model
+
+    def last_codex_model_for(self, chat_id: int, message_thread_id: int = 0) -> str:
+        with self.lock:
+            return self._resolved_codex_model_for(chat_id=chat_id, message_thread_id=message_thread_id)
+
+    def last_codex_reasoning_for(self, chat_id: int, message_thread_id: int = 0) -> str:
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        key = str(int(chat_id))
+        with self.lock:
+            reasoning = _normalize_codex_reasoning(self.last_codex_reasoning_by_scope.get(sk))
+            if (not reasoning) and int(message_thread_id or 0) == 0:
+                reasoning = _normalize_codex_reasoning(self.last_codex_reasoning_by_chat.get(key))
+            if not reasoning:
+                reasoning = _normalize_codex_reasoning(self.last_codex_reasoning)
+            return reasoning or 'medium'
+
+    def last_codex_profile_state_for(
+        self, chat_id: int, message_thread_id: int = 0
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return explicit per-scope codex profile state without synthetic fallbacks."""
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        key = str(int(chat_id))
+        with self.lock:
+            mode = _normalize_codex_mode(self.last_codex_mode_by_scope.get(sk))
+            if (not mode) and int(message_thread_id or 0) == 0:
+                mode = _normalize_codex_mode(self.last_codex_mode_by_chat.get(key))
+
+            model = self._resolved_codex_model_for(chat_id=chat_id, message_thread_id=message_thread_id)
+
+            reasoning = _normalize_codex_reasoning(self.last_codex_reasoning_by_scope.get(sk))
+            if (not reasoning) and int(message_thread_id or 0) == 0:
+                reasoning = _normalize_codex_reasoning(self.last_codex_reasoning_by_chat.get(key))
+
+        return (mode or None, model or None, reasoning or None)
+
     def set_last_codex_run(
         self,
         *,
@@ -2715,26 +2980,90 @@ class BotState:
         message_thread_id: int = 0,
         automation: bool,
         profile_name: str | None = None,
+        mode: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
     ) -> None:
+        norm_mode = _normalize_codex_mode(mode)
+        norm_reasoning = _normalize_codex_reasoning(reasoning)
+        norm_model = str(model or '').strip()
+
+        profile = (profile_name or '').strip()
+        if not profile:
+            if norm_mode == 'write':
+                profile = 'auto'
+            elif norm_mode == 'read':
+                profile = 'chat'
+            else:
+                profile = 'auto' if automation else 'chat'
+
         now = _now_ts()
-        profile = (profile_name or '').strip() or ('auto' if automation else 'chat')
+        sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
+        key = str(int(chat_id))
         with self.lock:
             # Legacy fields (kept for backward compatibility / debugging)
             self.last_codex_ts = float(now)
             self.last_codex_automation = bool(automation)
-            self.last_codex_profile = profile
+            self.last_codex_profile = (profile or self.last_codex_profile).strip() or ('auto' if automation else 'chat')
+
+            if norm_mode:
+                self.last_codex_mode = norm_mode
+                self.last_codex_mode_by_scope[sk] = norm_mode
+                if int(message_thread_id or 0) == 0:
+                    self.last_codex_mode_by_chat[key] = norm_mode
+            if model is not None:
+                if norm_model:
+                    self.last_codex_model_by_scope[sk] = norm_model
+                    if int(message_thread_id or 0) == 0:
+                        self.last_codex_model = norm_model
+                        self.last_codex_model_by_chat[key] = norm_model
+                else:
+                    self.last_codex_model_by_scope.pop(sk, None)
+                    if int(message_thread_id or 0) == 0:
+                        self.last_codex_model = ''
+                        self.last_codex_model_by_chat.pop(key, None)
+            if reasoning is not None:
+                self.last_codex_reasoning = norm_reasoning
+                self.last_codex_reasoning_by_scope[sk] = norm_reasoning
+                if int(message_thread_id or 0) == 0:
+                    self.last_codex_reasoning_by_chat[key] = norm_reasoning
+
             # Per-scope fields
-            sk = _scope_key(chat_id=int(chat_id), message_thread_id=int(message_thread_id or 0))
             self.last_codex_ts_by_scope[sk] = float(now)
             self.last_codex_automation_by_scope[sk] = bool(automation)
-            self.last_codex_profile_by_scope[sk] = profile
+            self.last_codex_profile_by_scope[sk] = self.last_codex_profile
             # Per-chat fields (legacy): maintain only for thread_id=0.
             if int(message_thread_id or 0) == 0:
-                key = str(int(chat_id))
                 self.last_codex_ts_by_chat[key] = float(now)
                 self.last_codex_automation_by_chat[key] = bool(automation)
-                self.last_codex_profile_by_chat[key] = profile
+                self.last_codex_profile_by_chat[key] = self.last_codex_profile
         self.save()
+
+    def set_last_codex_profile_state(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int = 0,
+        mode: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        profile_name: str | None = None,
+    ) -> None:
+        mode_norm = _normalize_codex_mode(mode)
+        reasoning_norm = _normalize_codex_reasoning(reasoning)
+        model_norm = str(model or '').strip()
+        profile = (profile_name or '').strip()
+        if not profile and mode_norm:
+            profile = 'auto' if mode_norm == 'write' else 'chat'
+        self.set_last_codex_run(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            automation=(mode_norm == 'write'),
+            profile_name=(profile or None),
+            mode=mode_norm,
+            model=(model_norm if model is not None else None),
+            reasoning=(reasoning_norm if reasoning is not None else None),
+        )
 
     def append_history(
         self,

@@ -18,6 +18,45 @@ def _summ(ev: _Ev) -> str:
 
 
 class TestParallelScheduler(unittest.TestCase):
+    def test_scope_sleep_blocks_scope_items_and_resumes(self) -> None:
+        s: ParallelScheduler[_Ev] = ParallelScheduler(max_parallel_jobs=1, summarize=_summ)
+        sleeping_scopes: set[tuple[int, int]] = {(1, 7)}
+
+        def _is_sleeping(chat_id: int, message_thread_id: int) -> bool:
+            return (int(chat_id), int(message_thread_id or 0)) in sleeping_scopes
+
+        a = _Ev(kind='text', chat_id=1, message_thread_id=7, received_ts=10.0, text='sleep')
+        b = _Ev(kind='text', chat_id=2, message_thread_id=0, received_ts=11.0, text='active')
+        s.enqueue(a)
+        s.enqueue(b)
+
+        first = s.try_dispatch_next(pause_active=False, pause_ts=0.0, scope_sleeping=_is_sleeping)
+        self.assertEqual(first, b)
+        s.mark_done(chat_id=2, message_thread_id=0)
+        self.assertIsNone(s.try_dispatch_next(pause_active=False, pause_ts=0.0, scope_sleeping=_is_sleeping))
+
+        sleeping_scopes.clear()
+        second = s.try_dispatch_next(pause_active=False, pause_ts=0.0, scope_sleeping=_is_sleeping)
+        self.assertEqual(second, a)
+
+    def test_callback_scope_sleep_blocks_and_resumes(self) -> None:
+        s: ParallelScheduler[_Ev] = ParallelScheduler(max_parallel_jobs=1, summarize=_summ)
+        sleeping_scopes: set[tuple[int, int]] = {(1, 7)}
+
+        def _is_sleeping(chat_id: int, message_thread_id: int) -> bool:
+            return (int(chat_id), int(message_thread_id or 0)) in sleeping_scopes
+
+        cb = _Ev(kind='callback', chat_id=1, message_thread_id=7, received_ts=10.0, text='callback while sleep')
+
+        s.enqueue(cb)
+        self.assertIsNone(
+            s.try_dispatch_next(pause_active=True, pause_ts=5.0, scope_sleeping=_is_sleeping)
+        )
+
+        sleeping_scopes.clear()
+        resumed = s.try_dispatch_next(pause_active=True, pause_ts=5.0, scope_sleeping=_is_sleeping)
+        self.assertEqual(resumed, cb)
+
     def test_per_scope_serialization_and_slots(self) -> None:
         s: ParallelScheduler[_Ev] = ParallelScheduler(max_parallel_jobs=2, summarize=_summ)
         ev1 = _Ev(kind='text', chat_id=1, message_thread_id=0, received_ts=10.0, text='a')

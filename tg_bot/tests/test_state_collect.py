@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+import time
+from unittest.mock import patch
 from pathlib import Path
 
 from tg_bot.state import BotState
@@ -185,3 +187,135 @@ class TestCollectStateSlice(unittest.TestCase):
             self.assertIsNone(st.collect_packet_decision(chat_id=chat_id, message_thread_id=message_thread_id, packet_id=packet_id))
             self.assertNotIn('3:4', st.collect_packet_decisions_by_scope)
             self.assertEqual(save_lock_free, [True])
+
+    def test_sleep_until_persists_per_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            now = time.time()
+            state_path.write_text(
+                json.dumps(
+                    {'sleep_until_by_scope': {'1:7': now + 3600.0, 'bad': 'x', 'bad:bad': 'not-ts'}}
+                ),
+                encoding='utf-8',
+            )
+
+            st = BotState(path=state_path)
+            st.load()
+            self.assertGreater(st.sleep_until(chat_id=1, message_thread_id=7), now)
+            self.assertEqual(st.sleep_until(chat_id=1, message_thread_id=8), 0.0)
+            st.set_sleep_until(chat_id=1, message_thread_id=8, until_ts=now + 4200.0)
+            self.assertEqual(st.sleep_until(chat_id=1, message_thread_id=8), now + 4200.0)
+
+            st2 = BotState(path=state_path)
+            st2.load()
+            self.assertEqual(st2.sleep_until(chat_id=1, message_thread_id=8), now + 4200.0)
+
+    def test_sleep_until_expires_and_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+
+            st.set_sleep_until(chat_id=5, message_thread_id=9, until_ts=1234.0)
+            with patch('tg_bot.state._now_ts', return_value=2000.0):
+                self.assertEqual(st.sleep_until(chat_id=5, message_thread_id=9), 0.0)
+
+            self.assertEqual(st.sleep_until(chat_id=5, message_thread_id=9), 0.0)
+
+    def test_sleep_until_clear_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            until_ts = time.time() + 300.0
+            st.set_sleep_until(chat_id=7, message_thread_id=1, until_ts=until_ts)
+            self.assertEqual(st.sleep_until(chat_id=7, message_thread_id=1), until_ts)
+
+            st.clear_sleep(chat_id=7, message_thread_id=1)
+            self.assertEqual(st.sleep_until(chat_id=7, message_thread_id=1), 0.0)
+
+            st2 = BotState(path=state_path)
+            st2.load()
+            self.assertEqual(st2.sleep_until(chat_id=7, message_thread_id=1), 0.0)
+
+    def test_last_codex_profile_state_persists_and_isolated_by_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            st.set_last_codex_profile_state(
+                chat_id=10,
+                message_thread_id=0,
+                mode='read',
+                model='gpt-root',
+                reasoning='medium',
+            )
+            st.set_last_codex_profile_state(
+                chat_id=10,
+                message_thread_id=11,
+                mode='write',
+                model='gpt-thread',
+                reasoning='high',
+            )
+
+            self.assertEqual(st.last_codex_profile_state_for(chat_id=10, message_thread_id=0), ('read', 'gpt-root', 'medium'))
+            self.assertEqual(st.last_codex_profile_state_for(chat_id=10, message_thread_id=11), ('write', 'gpt-thread', 'high'))
+
+            st.set_last_codex_profile_state(
+                chat_id=10,
+                message_thread_id=11,
+                mode='read',
+                reasoning='low',
+            )
+            self.assertEqual(st.last_codex_profile_state_for(chat_id=10, message_thread_id=11), ('read', 'gpt-thread', 'low'))
+
+            st2 = BotState(path=state_path)
+            st2.load()
+            self.assertEqual(st2.last_codex_profile_state_for(chat_id=10, message_thread_id=0), ('read', 'gpt-root', 'medium'))
+            self.assertEqual(st2.last_codex_profile_state_for(chat_id=10, message_thread_id=11), ('read', 'gpt-thread', 'low'))
+
+    def test_root_model_inherits_to_topic_and_topic_default_clears_override(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+            st.set_last_codex_profile_state(
+                chat_id=10,
+                message_thread_id=0,
+                mode='read',
+                model='gpt-root',
+                reasoning='medium',
+            )
+            st.set_last_codex_profile_state(
+                chat_id=10,
+                message_thread_id=11,
+                mode='read',
+                model='gpt-topic',
+                reasoning='high',
+            )
+            self.assertEqual(st.last_codex_model_for(chat_id=10, message_thread_id=11), 'gpt-topic')
+
+            st.set_last_codex_profile_state(chat_id=10, message_thread_id=11, model='')
+            self.assertEqual(st.last_codex_profile_state_for(chat_id=10, message_thread_id=11), ('read', 'gpt-root', 'high'))
+            self.assertEqual(st.last_codex_model_for(chat_id=10, message_thread_id=11), 'gpt-root')
+            self.assertEqual(st.last_codex_model_for(chat_id=10, message_thread_id=0), 'gpt-root')
+
+    def test_codex_profile_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            state_path.write_text('{}', encoding='utf-8')
+
+            st = BotState(path=state_path)
+            st.load()
+
+            self.assertEqual(st.last_codex_mode_for(chat_id=10, message_thread_id=11), 'read')
+            self.assertEqual(st.last_codex_reasoning_for(chat_id=10, message_thread_id=11), 'medium')
+            self.assertEqual(st.last_codex_model_for(chat_id=10, message_thread_id=11), '')
